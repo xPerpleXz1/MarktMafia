@@ -1,5 +1,4 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, AttachmentBuilder } = require('discord.js');
-const { createCanvas } = require('canvas');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
