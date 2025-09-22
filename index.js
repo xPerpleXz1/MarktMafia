@@ -104,59 +104,6 @@ db.serialize(() => {
         date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
         added_by TEXT NOT NULL
     )`);
-
-    // Migration für bestehende Datenbanken (falls jemand von alter Version kommt)
-    db.all("PRAGMA table_info(current_prices)", (err, columns) => {
-        if (!err && columns) {
-            const hasDisplayName = columns.some(col => col.name === 'display_name');
-            const hasMarketPrice = columns.some(col => col.name === 'market_price');
-            const hasStateValue = columns.some(col => col.name === 'state_value');
-            
-            if (!hasDisplayName || !hasMarketPrice || !hasStateValue) {
-                console.log('🔄 Migriere alte Datenbank...');
-                
-                // Backup der alten Tabelle
-                db.run(`CREATE TABLE IF NOT EXISTS current_prices_backup AS SELECT * FROM current_prices`);
-                
-                // Neue Spalten hinzufügen falls sie nicht existieren
-                if (!hasDisplayName) {
-                    db.run(`ALTER TABLE current_prices ADD COLUMN display_name TEXT DEFAULT ''`);
-                    db.run(`UPDATE current_prices SET display_name = item_name WHERE display_name = ''`);
-                }
-                if (!hasMarketPrice && !hasStateValue) {
-                    db.run(`ALTER TABLE current_prices ADD COLUMN market_price REAL DEFAULT 0`);
-                    db.run(`ALTER TABLE current_prices ADD COLUMN state_value REAL DEFAULT NULL`);
-                    db.run(`UPDATE current_prices SET market_price = price WHERE market_price = 0`);
-                }
-                
-                console.log('✅ Datenbank-Migration abgeschlossen!');
-            }
-        }
-    });
-
-    // Migration für Historie-Tabelle
-    db.all("PRAGMA table_info(price_history)", (err, columns) => {
-        if (!err && columns) {
-            const hasDisplayName = columns.some(col => col.name === 'display_name');
-            const hasMarketPrice = columns.some(col => col.name === 'market_price');
-            
-            if (!hasDisplayName || !hasMarketPrice) {
-                console.log('🔄 Migriere Historie-Tabelle...');
-                
-                if (!hasDisplayName) {
-                    db.run(`ALTER TABLE price_history ADD COLUMN display_name TEXT DEFAULT ''`);
-                    db.run(`UPDATE price_history SET display_name = item_name WHERE display_name = ''`);
-                }
-                if (!hasMarketPrice) {
-                    db.run(`ALTER TABLE price_history ADD COLUMN market_price REAL DEFAULT 0`);
-                    db.run(`ALTER TABLE price_history ADD COLUMN state_value REAL DEFAULT NULL`);
-                    db.run(`UPDATE price_history SET market_price = price WHERE market_price = 0`);
-                }
-                
-                console.log('✅ Historie-Migration abgeschlossen!');
-            }
-        }
-    });
 });
 
 // Chart Configuration
