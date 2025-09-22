@@ -1,0 +1,33 @@
+{
+  "name": "gta-strandmarkt-bot",
+  "version": "1.0.0",
+  "description": "Discord Bot für GTA V Grand RP Strandmarktpreise",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "sqlite3": "^5.1.6",
+    "canvas": "^2.11.2",
+    "chartjs-node-canvas": "^4.1.6",
+    "chart.js": "^4.4.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "gta",
+    "grand-rp",
+    "strandmarkt",
+    "preise"
+  ],
+  "author": "Dein Name",
+  "license": "MIT"
+}
