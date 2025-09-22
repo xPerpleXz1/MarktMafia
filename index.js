@@ -43,6 +43,16 @@ const width = 800;
 const height = 400;
 const chartJSNodeCanvas = new ChartJSNodeCanvas({ width, height });
 
+// Hilfsfunktion für Geld-Formatierung
+function formatCurrency(amount) {
+    return new Intl.NumberFormat('de-DE', {
+        style: 'currency',
+        currency: 'EUR',
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0
+    }).format(amount);
+}
+
 // Bot Events
 client.once('ready', () => {
     console.log(`Bot ist online als ${client.user.tag}!`);
@@ -58,7 +68,8 @@ async function registerCommands() {
             .addStringOption(option =>
                 option.setName('gegenstand')
                     .setDescription('Name des Gegenstands')
-                    .setRequired(true))
+                    .setRequired(true)
+                    .setAutocomplete(true))
             .addNumberOption(option =>
                 option.setName('preis')
                     .setDescription('Preis des Gegenstands')
@@ -74,7 +85,8 @@ async function registerCommands() {
             .addStringOption(option =>
                 option.setName('gegenstand')
                     .setDescription('Name des Gegenstands')
-                    .setRequired(true)),
+                    .setRequired(true)
+                    .setAutocomplete(true)),
 
         new SlashCommandBuilder()
             .setName('alle-preise')
@@ -86,7 +98,8 @@ async function registerCommands() {
             .addStringOption(option =>
                 option.setName('gegenstand')
                     .setDescription('Name des Gegenstands')
-                    .setRequired(true)),
+                    .setRequired(true)
+                    .setAutocomplete(true)),
 
         new SlashCommandBuilder()
             .setName('durchschnittspreis')
@@ -94,7 +107,8 @@ async function registerCommands() {
             .addStringOption(option =>
                 option.setName('gegenstand')
                     .setDescription('Name des Gegenstands')
-                    .setRequired(true))
+                    .setRequired(true)
+                    .setAutocomplete(true))
     ];
 
     try {
@@ -108,36 +122,61 @@ async function registerCommands() {
 
 // Command Handler
 client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand()) return;
+    if (interaction.isChatInputCommand()) {
+        const { commandName } = interaction;
 
-    const { commandName } = interaction;
-
-    try {
-        switch (commandName) {
-            case 'preis-hinzufugen':
-                await handleAddPrice(interaction);
-                break;
-            case 'preis-anzeigen':
-                await handleShowPrice(interaction);
-                break;
-            case 'alle-preise':
-                await handleShowAllPrices(interaction);
-                break;
-            case 'preis-verlauf':
-                await handlePriceHistory(interaction);
-                break;
-            case 'durchschnittspreis':
-                await handleAveragePrice(interaction);
-                break;
+        try {
+            switch (commandName) {
+                case 'preis-hinzufugen':
+                    await handleAddPrice(interaction);
+                    break;
+                case 'preis-anzeigen':
+                    await handleShowPrice(interaction);
+                    break;
+                case 'alle-preise':
+                    await handleShowAllPrices(interaction);
+                    break;
+                case 'preis-verlauf':
+                    await handlePriceHistory(interaction);
+                    break;
+                case 'durchschnittspreis':
+                    await handleAveragePrice(interaction);
+                    break;
+            }
+        } catch (error) {
+            console.error('Command Error:', error);
+            await interaction.reply({
+                content: 'Es ist ein Fehler aufgetreten!',
+                ephemeral: true
+            });
         }
-    } catch (error) {
-        console.error('Command Error:', error);
-        await interaction.reply({
-            content: 'Es ist ein Fehler aufgetreten!',
-            ephemeral: true
-        });
+    } else if (interaction.isAutocomplete()) {
+        await handleAutocomplete(interaction);
     }
 });
+
+// Autocomplete Handler
+async function handleAutocomplete(interaction) {
+    const focusedValue = interaction.options.getFocused();
+    
+    db.all(
+        'SELECT DISTINCT item_name FROM current_prices WHERE item_name LIKE ? ORDER BY item_name LIMIT 25',
+        [`%${focusedValue}%`],
+        (err, rows) => {
+            if (err) {
+                console.error(err);
+                return interaction.respond([]);
+            }
+
+            const choices = rows.map(row => ({
+                name: row.item_name,
+                value: row.item_name
+            }));
+
+            interaction.respond(choices);
+        }
+    );
+}
 
 // Add Price Handler
 async function handleAddPrice(interaction) {
@@ -168,12 +207,14 @@ async function handleAddPrice(interaction) {
 
             const embed = new EmbedBuilder()
                 .setColor('#00ff00')
-                .setTitle('✅ Preis aktualisiert!')
+                .setTitle('✅ Preis erfolgreich aktualisiert!')
                 .addFields(
-                    { name: 'Gegenstand', value: itemName, inline: true },
-                    { name: 'Preis', value: `${price}€`, inline: true },
-                    { name: 'Aktualisiert von', value: userId, inline: true }
+                    { name: '📦 Gegenstand', value: `\`${itemName}\``, inline: true },
+                    { name: '💰 Neuer Preis', value: `**${formatCurrency(price)}**`, inline: true },
+                    { name: '👤 Aktualisiert von', value: userId, inline: true },
+                    { name: '🕐 Zeitpunkt', value: `<t:${Math.floor(Date.now() / 1000)}:f>`, inline: false }
                 )
+                .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                 .setTimestamp();
 
             if (imageUrl) {
@@ -208,12 +249,14 @@ async function handleShowPrice(interaction) {
 
             const embed = new EmbedBuilder()
                 .setColor('#0099ff')
-                .setTitle(`💰 Aktueller Preis: ${row.item_name}`)
+                .setTitle(`💰 ${row.item_name}`)
+                .setDescription(`**Aktueller Strandmarktpreis**`)
                 .addFields(
-                    { name: 'Preis', value: `${row.price}€`, inline: true },
-                    { name: 'Zuletzt aktualisiert', value: new Date(row.last_updated).toLocaleString('de-DE'), inline: true },
-                    { name: 'Aktualisiert von', value: row.updated_by, inline: true }
+                    { name: '💵 Preis', value: `**${formatCurrency(row.price)}**`, inline: true },
+                    { name: '📅 Letzte Aktualisierung', value: `<t:${Math.floor(new Date(row.last_updated).getTime() / 1000)}:R>`, inline: true },
+                    { name: '👤 Von', value: `${row.updated_by}`, inline: true }
                 )
+                .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                 .setTimestamp();
 
             if (row.image_url) {
@@ -246,15 +289,26 @@ async function handleShowAllPrices(interaction) {
             const embed = new EmbedBuilder()
                 .setColor('#ff9900')
                 .setTitle('📋 Alle Strandmarktpreise')
+                .setDescription(`**${rows.length} Artikel verfügbar**`)
+                .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                 .setTimestamp();
 
-            rows.forEach(row => {
-                embed.addFields({
-                    name: row.item_name,
-                    value: `${row.price}€ (${new Date(row.last_updated).toLocaleDateString('de-DE')})`,
-                    inline: true
-                });
+            // Sortiere nach Preis (höchster zuerst)
+            rows.sort((a, b) => b.price - a.price);
+
+            // Erstelle schönere Anzeige in Spalten
+            let itemList = '';
+            rows.forEach((row, index) => {
+                const emoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '📦';
+                itemList += `${emoji} **${row.item_name}**\n`;
+                itemList += `💰 ${formatCurrency(row.price)} • <t:${Math.floor(new Date(row.last_updated).getTime() / 1000)}:R>\n\n`;
             });
+
+            if (itemList.length > 4000) {
+                itemList = itemList.substring(0, 4000) + '...\n\n*Zu viele Artikel - zeige nur die ersten*';
+            }
+
+            embed.setDescription(`**${rows.length} Artikel verfügbar**\n\n${itemList}`);
 
             interaction.followUp({ embeds: [embed] });
         }
@@ -293,9 +347,13 @@ async function handlePriceHistory(interaction) {
                     datasets: [{
                         label: `${itemName} Preisverlauf`,
                         data: prices,
-                        borderColor: 'rgb(75, 192, 192)',
-                        backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                        tension: 0.1
+                        borderColor: '#ff6600',
+                        backgroundColor: 'rgba(255, 102, 0, 0.1)',
+                        tension: 0.3,
+                        fill: true,
+                        pointRadius: 6,
+                        pointHoverRadius: 8,
+                        borderWidth: 3
                     }]
                 },
                 options: {
@@ -303,7 +361,11 @@ async function handlePriceHistory(interaction) {
                     plugins: {
                         title: {
                             display: true,
-                            text: `Preisverlauf: ${itemName}`
+                            text: `📈 Preisverlauf: ${itemName}`,
+                            font: { size: 16, weight: 'bold' }
+                        },
+                        legend: {
+                            display: false
                         }
                     },
                     scales: {
@@ -311,7 +373,24 @@ async function handlePriceHistory(interaction) {
                             beginAtZero: false,
                             title: {
                                 display: true,
-                                text: 'Preis (€)'
+                                text: 'Preis (€)',
+                                font: { size: 14, weight: 'bold' }
+                            },
+                            ticks: {
+                                callback: function(value) {
+                                    return new Intl.NumberFormat('de-DE', {
+                                        style: 'currency',
+                                        currency: 'EUR',
+                                        minimumFractionDigits: 0
+                                    }).format(value);
+                                }
+                            }
+                        },
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Datum',
+                                font: { size: 14, weight: 'bold' }
                             }
                         }
                     }
@@ -325,8 +404,14 @@ async function handlePriceHistory(interaction) {
                 const embed = new EmbedBuilder()
                     .setColor('#ff6600')
                     .setTitle(`📈 Preisverlauf: ${itemName}`)
-                    .setDescription(`**Anzahl Einträge:** ${rows.length}`)
+                    .setDescription(`**${rows.length} Preiseinträge** • Diagramm zeigt die Entwicklung`)
+                    .addFields(
+                        { name: '📊 Aktueller Preis', value: `${formatCurrency(prices[prices.length - 1])}`, inline: true },
+                        { name: '📈 Höchster Preis', value: `${formatCurrency(Math.max(...prices))}`, inline: true },
+                        { name: '📉 Niedrigster Preis', value: `${formatCurrency(Math.min(...prices))}`, inline: true }
+                    )
                     .setImage('attachment://preisverlauf.png')
+                    .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                     .setTimestamp();
 
                 interaction.followUp({ embeds: [embed], files: [attachment] });
@@ -337,16 +422,19 @@ async function handlePriceHistory(interaction) {
                 const embed = new EmbedBuilder()
                     .setColor('#ff6600')
                     .setTitle(`📈 Preisverlauf: ${itemName}`)
-                    .setDescription('Diagramm konnte nicht erstellt werden. Hier die Daten:')
+                    .setDescription('⚠️ Diagramm konnte nicht erstellt werden. Hier die letzten 10 Einträge:')
+                    .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                     .setTimestamp();
 
-                rows.forEach((row, index) => {
-                    embed.addFields({
-                        name: `Eintrag ${index + 1}`,
-                        value: `${row.price}€ (${new Date(row.date_added).toLocaleString('de-DE')})`,
-                        inline: true
-                    });
+                const lastEntries = rows.slice(-10);
+                let priceHistory = '';
+                lastEntries.forEach((row, index) => {
+                    const date = new Date(row.date_added);
+                    const timestamp = Math.floor(date.getTime() / 1000);
+                    priceHistory += `**${formatCurrency(row.price)}** • <t:${timestamp}:R>\n`;
                 });
+
+                embed.setDescription(`⚠️ Diagramm konnte nicht erstellt werden.\n\n**Letzte ${lastEntries.length} Einträge:**\n${priceHistory}`);
 
                 interaction.followUp({ embeds: [embed] });
             }
@@ -383,12 +471,16 @@ async function handleAveragePrice(interaction) {
             const embed = new EmbedBuilder()
                 .setColor('#9900ff')
                 .setTitle(`📊 Statistiken: ${itemName}`)
+                .setDescription(`**Basierend auf ${rows.length} Preiseinträgen**`)
                 .addFields(
-                    { name: 'Durchschnittspreis', value: `${average.toFixed(2)}€`, inline: true },
-                    { name: 'Niedrigster Preis', value: `${minPrice}€`, inline: true },
-                    { name: 'Höchster Preis', value: `${maxPrice}€`, inline: true },
-                    { name: 'Anzahl Einträge', value: `${rows.length}`, inline: true }
+                    { name: '💰 Durchschnittspreis', value: `**${formatCurrency(average)}**`, inline: true },
+                    { name: '📉 Niedrigster Preis', value: `**${formatCurrency(minPrice)}**`, inline: true },
+                    { name: '📈 Höchster Preis', value: `**${formatCurrency(maxPrice)}**`, inline: true },
+                    { name: '📊 Preisdifferenz', value: `**${formatCurrency(maxPrice - minPrice)}**`, inline: true },
+                    { name: '📈 Varianz', value: `${((maxPrice - minPrice) / average * 100).toFixed(1)}%`, inline: true },
+                    { name: '📋 Gesamte Einträge', value: `**${rows.length}**`, inline: true }
                 )
+                .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                 .setTimestamp();
 
             interaction.followUp({ embeds: [embed] });
