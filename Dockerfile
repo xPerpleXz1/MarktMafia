@@ -1,20 +1,16 @@
 # Node.js Base Image
 FROM node:18-alpine
 
-# System dependencies für Canvas und SQLite
+# System dependencies für SQLite und Charts
 RUN apk add --no-cache \
+    python3 \
+    make \
+    g++ \
     cairo-dev \
     jpeg-dev \
     pango-dev \
-    musl-dev \
     giflib-dev \
-    pixman-dev \
-    pangomm-dev \
-    libjpeg-turbo-dev \
-    freetype-dev \
-    python3 \
-    make \
-    g++
+    pixman-dev
 
 # Arbeitsverzeichnis erstellen
 WORKDIR /app
