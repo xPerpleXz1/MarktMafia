@@ -10,9 +10,7 @@
   "dependencies": {
     "discord.js": "^14.14.1",
     "sqlite3": "^5.1.6",
-    "canvas": "^2.11.2",
-    "chartjs-node-canvas": "^4.1.6",
-    "chart.js": "^4.4.1"
+    "chartjs-node-canvas": "^4.1.6"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
