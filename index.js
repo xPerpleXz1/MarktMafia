@@ -104,6 +104,59 @@ db.serialize(() => {
         date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
         added_by TEXT NOT NULL
     )`);
+
+    // Migration für bestehende Datenbanken (falls jemand von alter Version kommt)
+    db.all("PRAGMA table_info(current_prices)", (err, columns) => {
+        if (!err && columns) {
+            const hasDisplayName = columns.some(col => col.name === 'display_name');
+            const hasMarketPrice = columns.some(col => col.name === 'market_price');
+            const hasStateValue = columns.some(col => col.name === 'state_value');
+            
+            if (!hasDisplayName || !hasMarketPrice || !hasStateValue) {
+                console.log('🔄 Migriere alte Datenbank...');
+                
+                // Backup der alten Tabelle
+                db.run(`CREATE TABLE IF NOT EXISTS current_prices_backup AS SELECT * FROM current_prices`);
+                
+                // Neue Spalten hinzufügen falls sie nicht existieren
+                if (!hasDisplayName) {
+                    db.run(`ALTER TABLE current_prices ADD COLUMN display_name TEXT DEFAULT ''`);
+                    db.run(`UPDATE current_prices SET display_name = item_name WHERE display_name = ''`);
+                }
+                if (!hasMarketPrice && !hasStateValue) {
+                    db.run(`ALTER TABLE current_prices ADD COLUMN market_price REAL DEFAULT 0`);
+                    db.run(`ALTER TABLE current_prices ADD COLUMN state_value REAL DEFAULT NULL`);
+                    db.run(`UPDATE current_prices SET market_price = price WHERE market_price = 0`);
+                }
+                
+                console.log('✅ Datenbank-Migration abgeschlossen!');
+            }
+        }
+    });
+
+    // Migration für Historie-Tabelle
+    db.all("PRAGMA table_info(price_history)", (err, columns) => {
+        if (!err && columns) {
+            const hasDisplayName = columns.some(col => col.name === 'display_name');
+            const hasMarketPrice = columns.some(col => col.name === 'market_price');
+            
+            if (!hasDisplayName || !hasMarketPrice) {
+                console.log('🔄 Migriere Historie-Tabelle...');
+                
+                if (!hasDisplayName) {
+                    db.run(`ALTER TABLE price_history ADD COLUMN display_name TEXT DEFAULT ''`);
+                    db.run(`UPDATE price_history SET display_name = item_name WHERE display_name = ''`);
+                }
+                if (!hasMarketPrice) {
+                    db.run(`ALTER TABLE price_history ADD COLUMN market_price REAL DEFAULT 0`);
+                    db.run(`ALTER TABLE price_history ADD COLUMN state_value REAL DEFAULT NULL`);
+                    db.run(`UPDATE price_history SET market_price = price WHERE market_price = 0`);
+                }
+                
+                console.log('✅ Historie-Migration abgeschlossen!');
+            }
+        }
+    });
 });
 
 // Chart Configuration
@@ -267,51 +320,87 @@ async function handleAddPrice(interaction) {
         [itemName, displayName, marketPrice, stateValue, imageUrl, userId]
     );
 
-    // Aktuellen Preis aktualisieren oder hinzufügen
-    db.run(
-        `INSERT OR REPLACE INTO current_prices (item_name, display_name, market_price, state_value, image_url, updated_by, last_updated)
-         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-        [itemName, displayName, marketPrice, stateValue, imageUrl, userId],
-        function(err) {
-            if (err) {
-                console.error(err);
-                interaction.followUp('Fehler beim Speichern des Preises!');
-                return;
-            }
-
-            const embed = new EmbedBuilder()
-                .setColor('#00ff00')
-                .setTitle('✅ Preis erfolgreich aktualisiert!')
-                .addFields(
-                    { name: '📦 Gegenstand', value: `\`${displayName}\``, inline: true },
-                    { name: '💰 Marktpreis', value: `**${formatCurrency(marketPrice)}**`, inline: true },
-                    { name: '🏛️ Staatswert', value: stateValue ? `**${formatCurrency(stateValue)}**` : '*Nicht angegeben*', inline: true },
-                    { name: '👤 Aktualisiert von', value: userId, inline: true },
-                    { name: '🕐 Zeitpunkt', value: `<t:${Math.floor(Date.now() / 1000)}:f>`, inline: true }
-                )
-                .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
-                .setTimestamp();
-
-            // Gewinnberechnung wenn beide Preise vorhanden
-            if (stateValue && stateValue > 0) {
-                const profit = marketPrice - stateValue;
-                const profitPercent = ((profit / stateValue) * 100).toFixed(1);
-                const profitColor = profit > 0 ? '📈' : '📉';
-                
-                embed.addFields({
-                    name: `${profitColor} Gewinn/Verlust`,
-                    value: `**${formatCurrency(profit)}** (${profitPercent}%)`,
-                    inline: false
-                });
-            }
-
-            if (imageUrl) {
-                embed.setThumbnail(imageUrl);
-            }
-
-            interaction.followUp({ embeds: [embed] });
+    // Aktuellen Preis aktualisieren oder hinzufügen - ohne bestehende Werte zu überschreiben
+    db.get('SELECT * FROM current_prices WHERE item_name = ?', [itemName], (err, existingRow) => {
+        if (err) {
+            console.error(err);
+            interaction.followUp('Fehler beim Prüfen bestehender Daten!');
+            return;
         }
-    );
+
+        // Bestimme finale Werte - behalte alte Werte wenn neue nicht angegeben
+        let finalStateValue = stateValue;
+        let finalImageUrl = imageUrl;
+
+        if (existingRow) {
+            // Behalte alte Werte wenn keine neuen angegeben wurden
+            if (stateValue === null && existingRow.state_value !== null) {
+                finalStateValue = existingRow.state_value;
+            }
+            if (!imageUrl && existingRow.image_url) {
+                finalImageUrl = existingRow.image_url;
+            }
+        }
+
+        db.run(
+            `INSERT OR REPLACE INTO current_prices (item_name, display_name, market_price, state_value, image_url, updated_by, last_updated)
+             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+            [itemName, displayName, marketPrice, finalStateValue, finalImageUrl, userId],
+            function(err) {
+                if (err) {
+                    console.error(err);
+                    interaction.followUp('Fehler beim Speichern des Preises!');
+                    return;
+                }
+
+                const embed = new EmbedBuilder()
+                    .setColor('#00ff00')
+                    .setTitle('✅ Preis erfolgreich aktualisiert!')
+                    .addFields(
+                        { name: '📦 Gegenstand', value: `\`${displayName}\``, inline: true },
+                        { name: '💰 Marktpreis', value: `**${formatCurrency(marketPrice)}**`, inline: true },
+                        { name: '🏛️ Staatswert', value: finalStateValue ? `**${formatCurrency(finalStateValue)}**` : '*Nicht angegeben*', inline: true },
+                        { name: '👤 Aktualisiert von', value: userId, inline: true },
+                        { name: '🕐 Zeitpunkt', value: `<t:${Math.floor(Date.now() / 1000)}:f>`, inline: true }
+                    )
+                    .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
+                    .setTimestamp();
+
+                // Status-Info hinzufügen
+                let statusInfo = '🆕 Neuer Eintrag erstellt';
+                if (existingRow) {
+                    statusInfo = '🔄 Bestehender Eintrag aktualisiert';
+                    if (finalStateValue !== stateValue && stateValue === null) {
+                        statusInfo += ' (Staatswert beibehalten)';
+                    }
+                    if (finalImageUrl !== imageUrl && !imageUrl) {
+                        statusInfo += ' (Bild beibehalten)';
+                    }
+                }
+
+                embed.addFields({ name: 'ℹ️ Status', value: statusInfo, inline: false });
+
+                // Gewinnberechnung wenn beide Preise vorhanden
+                if (finalStateValue && finalStateValue > 0) {
+                    const profit = marketPrice - finalStateValue;
+                    const profitPercent = ((profit / finalStateValue) * 100).toFixed(1);
+                    const profitColor = profit > 0 ? '📈' : '📉';
+                    
+                    embed.addFields({
+                        name: `${profitColor} Gewinn/Verlust`,
+                        value: `**${formatCurrency(profit)}** (${profitPercent}%)`,
+                        inline: false
+                    });
+                }
+
+                if (finalImageUrl) {
+                    embed.setThumbnail(finalImageUrl);
+                }
+
+                interaction.followUp({ embeds: [embed] });
+            }
+        );
+    });
 }
 
 // Show Price Handler
