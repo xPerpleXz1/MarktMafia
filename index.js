@@ -1,4 +1,68 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, AttachmentBuilder } = require('discord.js');
+// Average Price Handler
+async function handleAveragePrice(interaction) {
+    const searchName = interaction.options.getString('gegenstand').trim();
+
+    await interaction.deferReply();
+
+    db.all(
+        'SELECT market_price as price, state_value FROM price_history WHERE display_name = ? OR item_name = ?',
+        [searchName, searchName.toLowerCase()],
+        (err, rows) => {
+            if (err) {
+                console.error(err);
+                interaction.followUp('Fehler beim Berechnen des Durchschnitts!');
+                return;
+            }
+
+            if (rows.length === 0) {
+                interaction.followUp(`❌ Keine Daten für "${searchName}" gefunden!`);
+                return;
+            }
+
+            const marketPrices = rows.map(row => row.price);
+            const statePrices = rows.filter(row => row.state_value).map(row => row.state_value);
+            
+            const averageMarket = marketPrices.reduce((sum, price) => sum + price, 0) / marketPrices.length;
+            const minMarket = Math.min(...marketPrices);
+            const maxMarket = Math.max(...marketPrices);
+
+            const embed = new EmbedBuilder()
+                .setColor('#9900ff')
+                .setTitle(`📊 Statistiken: ${searchName}`)
+                .setDescription(`**Basierend auf ${rows.length} Preiseinträgen**`)
+                .addFields(
+                    { name: '💰 Ø Marktpreis', value: `**${formatCurrency(averageMarket)}**`, inline: true },
+                    { name: '📉 Min. Marktpreis', value: `**${formatCurrency(minMarket)}**`, inline: true },
+                    { name: '📈 Max. Marktpreis', value: `**${formatCurrency(maxMarket)}**`, inline: true },
+                    { name: '📊 Markt-Schwankung', value: `**${formatCurrency(maxMarket - minMarket)}**`, inline: true },
+                    { name: '📈 Markt-Varianz', value: `${((maxMarket - minMarket) / averageMarket * 100).toFixed(1)}%`, inline: true },
+                    { name: '📋 Gesamte Einträge', value: `**${rows.length}**`, inline: true }
+                )
+                .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
+                .setTimestamp();
+
+            // Staatswert-Statistiken hinzufügen wenn verfügbar
+            if (statePrices.length > 0) {
+                const averageState = statePrices.reduce((sum, price) => sum + price, 0) / statePrices.length;
+                const minState = Math.min(...statePrices);
+                const maxState = Math.max(...statePrices);
+                const avgProfit = averageMarket - averageState;
+                const avgProfitPercent = ((avgProfit / averageState) * 100).toFixed(1);
+
+                embed.addFields(
+                    { name: '🏛️ Ø Staatswert', value: `**${formatCurrency(averageState)}**`, inline: true },
+                    { name: '📉 Min. Staatswert', value: `**${formatCurrency(minState)}**`, inline: true },
+                    { name: '📈 Max. Staatswert', value: `**${formatCurrency(maxState)}**`, inline: true },
+                    { name: '💹 Ø Gewinn/Verlust', value: `**${formatCurrency(avgProfit)}**`, inline: true },
+                    { name: '📊 Ø Gewinn %', value: `**${avgProfitPercent}%**`, inline: true },
+                    { name: '🏛️ Staatswert-Einträge', value: `**${statePrices.length}**`, inline: true }
+                );
+            }
+
+            interaction.followUp({ embeds: [embed] });
+        }
+    );
+}const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
@@ -21,7 +85,9 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS current_prices (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         item_name TEXT UNIQUE NOT NULL,
-        price REAL NOT NULL,
+        display_name TEXT NOT NULL,
+        market_price REAL NOT NULL,
+        state_value REAL,
         image_url TEXT,
         last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_by TEXT NOT NULL
@@ -31,11 +97,66 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS price_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         item_name TEXT NOT NULL,
-        price REAL NOT NULL,
+        display_name TEXT NOT NULL,
+        market_price REAL NOT NULL,
+        state_value REAL,
         image_url TEXT,
         date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
         added_by TEXT NOT NULL
     )`);
+
+    // Migration für bestehende Datenbanken (falls jemand von alter Version kommt)
+    db.all("PRAGMA table_info(current_prices)", (err, columns) => {
+        if (!err && columns) {
+            const hasDisplayName = columns.some(col => col.name === 'display_name');
+            const hasMarketPrice = columns.some(col => col.name === 'market_price');
+            const hasStateValue = columns.some(col => col.name === 'state_value');
+            
+            if (!hasDisplayName || !hasMarketPrice || !hasStateValue) {
+                console.log('🔄 Migriere alte Datenbank...');
+                
+                // Backup der alten Tabelle
+                db.run(`CREATE TABLE IF NOT EXISTS current_prices_backup AS SELECT * FROM current_prices`);
+                
+                // Neue Spalten hinzufügen falls sie nicht existieren
+                if (!hasDisplayName) {
+                    db.run(`ALTER TABLE current_prices ADD COLUMN display_name TEXT DEFAULT ''`);
+                    db.run(`UPDATE current_prices SET display_name = item_name WHERE display_name = ''`);
+                }
+                if (!hasMarketPrice && !hasStateValue) {
+                    db.run(`ALTER TABLE current_prices ADD COLUMN market_price REAL DEFAULT 0`);
+                    db.run(`ALTER TABLE current_prices ADD COLUMN state_value REAL DEFAULT NULL`);
+                    db.run(`UPDATE current_prices SET market_price = price WHERE market_price = 0`);
+                }
+                
+                console.log('✅ Datenbank-Migration abgeschlossen!');
+            }
+        }
+    });
+
+    // Migration für Historie-Tabelle
+    db.all("PRAGMA table_info(price_history)", (err, columns) => {
+        if (!err && columns) {
+            const hasDisplayName = columns.some(col => col.name === 'display_name');
+            const hasMarketPrice = columns.some(col => col.name === 'market_price');
+            
+            if (!hasDisplayName || !hasMarketPrice) {
+                console.log('🔄 Migriere Historie-Tabelle...');
+                
+                if (!hasDisplayName) {
+                    db.run(`ALTER TABLE price_history ADD COLUMN display_name TEXT DEFAULT ''`);
+                    db.run(`UPDATE price_history SET display_name = item_name WHERE display_name = ''`);
+                }
+                if (!hasMarketPrice) {
+                    db.run(`ALTER TABLE price_history ADD COLUMN market_price REAL DEFAULT 0`);
+                    db.run(`ALTER TABLE price_history ADD COLUMN state_value REAL DEFAULT NULL`);
+                    db.run(`UPDATE price_history SET market_price = price WHERE market_price = 0`);
+                }
+                
+                console.log('✅ Historie-Migration abgeschlossen!');
+            }
+        }
+    });
 });
 
 // Chart Configuration
@@ -67,13 +188,17 @@ async function registerCommands() {
             .setDescription('Füge einen neuen Strandmarktpreis hinzu')
             .addStringOption(option =>
                 option.setName('gegenstand')
-                    .setDescription('Name des Gegenstands')
+                    .setDescription('Name des Gegenstands (z.B. AK-47)')
                     .setRequired(true)
                     .setAutocomplete(true))
             .addNumberOption(option =>
-                option.setName('preis')
-                    .setDescription('Preis des Gegenstands')
+                option.setName('marktpreis')
+                    .setDescription('Aktueller Marktpreis (Handel zwischen Spielern)')
                     .setRequired(true))
+            .addNumberOption(option =>
+                option.setName('staatswert')
+                    .setDescription('Staatswert/NPC-Preis (optional)')
+                    .setRequired(false))
             .addStringOption(option =>
                 option.setName('bild')
                     .setDescription('URL zum Bild (optional)')
@@ -160,8 +285,8 @@ async function handleAutocomplete(interaction) {
     const focusedValue = interaction.options.getFocused();
     
     db.all(
-        'SELECT DISTINCT item_name FROM current_prices WHERE item_name LIKE ? ORDER BY item_name LIMIT 25',
-        [`%${focusedValue}%`],
+        'SELECT DISTINCT display_name, item_name FROM current_prices WHERE display_name LIKE ? OR item_name LIKE ? ORDER BY display_name LIMIT 25',
+        [`%${focusedValue}%`, `%${focusedValue.toLowerCase()}%`],
         (err, rows) => {
             if (err) {
                 console.error(err);
@@ -169,8 +294,8 @@ async function handleAutocomplete(interaction) {
             }
 
             const choices = rows.map(row => ({
-                name: row.item_name,
-                value: row.item_name
+                name: row.display_name,
+                value: row.display_name
             }));
 
             interaction.respond(choices);
@@ -180,8 +305,10 @@ async function handleAutocomplete(interaction) {
 
 // Add Price Handler
 async function handleAddPrice(interaction) {
-    const itemName = interaction.options.getString('gegenstand').toLowerCase();
-    const price = interaction.options.getNumber('preis');
+    const displayName = interaction.options.getString('gegenstand').trim();
+    const itemName = displayName.toLowerCase();
+    const marketPrice = interaction.options.getNumber('marktpreis');
+    const stateValue = interaction.options.getNumber('staatswert');
     const imageUrl = interaction.options.getString('bild');
     const userId = interaction.user.tag;
 
@@ -189,15 +316,15 @@ async function handleAddPrice(interaction) {
 
     // Zur Historie hinzufügen
     db.run(
-        'INSERT INTO price_history (item_name, price, image_url, added_by) VALUES (?, ?, ?, ?)',
-        [itemName, price, imageUrl, userId]
+        'INSERT INTO price_history (item_name, display_name, market_price, state_value, image_url, added_by) VALUES (?, ?, ?, ?, ?, ?)',
+        [itemName, displayName, marketPrice, stateValue, imageUrl, userId]
     );
 
     // Aktuellen Preis aktualisieren oder hinzufügen
     db.run(
-        `INSERT OR REPLACE INTO current_prices (item_name, price, image_url, updated_by, last_updated)
-         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-        [itemName, price, imageUrl, userId],
+        `INSERT OR REPLACE INTO current_prices (item_name, display_name, market_price, state_value, image_url, updated_by, last_updated)
+         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+        [itemName, displayName, marketPrice, stateValue, imageUrl, userId],
         function(err) {
             if (err) {
                 console.error(err);
@@ -209,13 +336,27 @@ async function handleAddPrice(interaction) {
                 .setColor('#00ff00')
                 .setTitle('✅ Preis erfolgreich aktualisiert!')
                 .addFields(
-                    { name: '📦 Gegenstand', value: `\`${itemName}\``, inline: true },
-                    { name: '💰 Neuer Preis', value: `**${formatCurrency(price)}**`, inline: true },
+                    { name: '📦 Gegenstand', value: `\`${displayName}\``, inline: true },
+                    { name: '💰 Marktpreis', value: `**${formatCurrency(marketPrice)}**`, inline: true },
+                    { name: '🏛️ Staatswert', value: stateValue ? `**${formatCurrency(stateValue)}**` : '*Nicht angegeben*', inline: true },
                     { name: '👤 Aktualisiert von', value: userId, inline: true },
-                    { name: '🕐 Zeitpunkt', value: `<t:${Math.floor(Date.now() / 1000)}:f>`, inline: false }
+                    { name: '🕐 Zeitpunkt', value: `<t:${Math.floor(Date.now() / 1000)}:f>`, inline: true }
                 )
                 .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                 .setTimestamp();
+
+            // Gewinnberechnung wenn beide Preise vorhanden
+            if (stateValue && stateValue > 0) {
+                const profit = marketPrice - stateValue;
+                const profitPercent = ((profit / stateValue) * 100).toFixed(1);
+                const profitColor = profit > 0 ? '📈' : '📉';
+                
+                embed.addFields({
+                    name: `${profitColor} Gewinn/Verlust`,
+                    value: `**${formatCurrency(profit)}** (${profitPercent}%)`,
+                    inline: false
+                });
+            }
 
             if (imageUrl) {
                 embed.setThumbnail(imageUrl);
@@ -228,13 +369,14 @@ async function handleAddPrice(interaction) {
 
 // Show Price Handler
 async function handleShowPrice(interaction) {
-    const itemName = interaction.options.getString('gegenstand').toLowerCase();
+    const searchName = interaction.options.getString('gegenstand').trim();
 
     await interaction.deferReply();
 
+    // Suche sowohl nach display_name als auch item_name
     db.get(
-        'SELECT * FROM current_prices WHERE item_name = ?',
-        [itemName],
+        'SELECT * FROM current_prices WHERE display_name = ? OR item_name = ?',
+        [searchName, searchName.toLowerCase()],
         (err, row) => {
             if (err) {
                 console.error(err);
@@ -243,21 +385,36 @@ async function handleShowPrice(interaction) {
             }
 
             if (!row) {
-                interaction.followUp(`❌ Kein Preis für "${itemName}" gefunden!`);
+                interaction.followUp(`❌ Kein Preis für "${searchName}" gefunden!`);
                 return;
             }
 
             const embed = new EmbedBuilder()
                 .setColor('#0099ff')
-                .setTitle(`💰 ${row.item_name}`)
-                .setDescription(`**Aktueller Strandmarktpreis**`)
+                .setTitle(`💰 ${row.display_name}`)
+                .setDescription(`**Aktuelle Strandmarktpreise**`)
                 .addFields(
-                    { name: '💵 Preis', value: `**${formatCurrency(row.price)}**`, inline: true },
+                    { name: '💵 Marktpreis', value: `**${formatCurrency(row.market_price)}**`, inline: true },
+                    { name: '🏛️ Staatswert', value: row.state_value ? `**${formatCurrency(row.state_value)}**` : '*Nicht verfügbar*', inline: true },
                     { name: '📅 Letzte Aktualisierung', value: `<t:${Math.floor(new Date(row.last_updated).getTime() / 1000)}:R>`, inline: true },
                     { name: '👤 Von', value: `${row.updated_by}`, inline: true }
                 )
                 .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                 .setTimestamp();
+
+            // Gewinnberechnung wenn beide Preise vorhanden
+            if (row.state_value && row.state_value > 0) {
+                const profit = row.market_price - row.state_value;
+                const profitPercent = ((profit / row.state_value) * 100).toFixed(1);
+                const profitColor = profit > 0 ? '📈' : '📉';
+                const profitText = profit > 0 ? 'Gewinn' : 'Verlust';
+                
+                embed.addFields({
+                    name: `${profitColor} ${profitText} pro Stück`,
+                    value: `**${formatCurrency(Math.abs(profit))}** (${Math.abs(profitPercent)}%)`,
+                    inline: false
+                });
+            }
 
             if (row.image_url) {
                 embed.setThumbnail(row.image_url);
@@ -293,15 +450,23 @@ async function handleShowAllPrices(interaction) {
                 .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                 .setTimestamp();
 
-            // Sortiere nach Preis (höchster zuerst)
-            rows.sort((a, b) => b.price - a.price);
+            // Sortiere nach Marktpreis (höchster zuerst)
+            rows.sort((a, b) => b.market_price - a.market_price);
 
             // Erstelle schönere Anzeige in Spalten
             let itemList = '';
             rows.forEach((row, index) => {
                 const emoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '📦';
-                itemList += `${emoji} **${row.item_name}**\n`;
-                itemList += `💰 ${formatCurrency(row.price)} • <t:${Math.floor(new Date(row.last_updated).getTime() / 1000)}:R>\n\n`;
+                itemList += `${emoji} **${row.display_name}**\n`;
+                itemList += `💰 ${formatCurrency(row.market_price)}`;
+                
+                if (row.state_value) {
+                    const profit = row.market_price - row.state_value;
+                    const profitEmoji = profit > 0 ? '📈' : profit < 0 ? '📉' : '➡️';
+                    itemList += ` | 🏛️ ${formatCurrency(row.state_value)} ${profitEmoji}`;
+                }
+                
+                itemList += ` • <t:${Math.floor(new Date(row.last_updated).getTime() / 1000)}:R>\n\n`;
             });
 
             if (itemList.length > 4000) {
@@ -317,13 +482,14 @@ async function handleShowAllPrices(interaction) {
 
 // Price History Handler with Chart
 async function handlePriceHistory(interaction) {
-    const itemName = interaction.options.getString('gegenstand').toLowerCase();
+    const searchName = interaction.options.getString('gegenstand').trim();
 
     await interaction.deferReply();
 
+    // Suche in Historie sowohl nach display_name als auch item_name
     db.all(
-        'SELECT price, date_added FROM price_history WHERE item_name = ? ORDER BY date_added',
-        [itemName],
+        'SELECT market_price as price, state_value, date_added FROM price_history WHERE display_name = ? OR item_name = ? ORDER BY date_added',
+        [searchName, searchName.toLowerCase()],
         async (err, rows) => {
             if (err) {
                 console.error(err);
@@ -332,40 +498,61 @@ async function handlePriceHistory(interaction) {
             }
 
             if (rows.length === 0) {
-                interaction.followUp(`❌ Keine Historie für "${itemName}" gefunden!`);
+                interaction.followUp(`❌ Keine Historie für "${searchName}" gefunden!`);
                 return;
             }
 
             // Chart erstellen
             const labels = rows.map(row => new Date(row.date_added).toLocaleDateString('de-DE'));
-            const prices = rows.map(row => row.price);
+            const marketPrices = rows.map(row => row.price);
+            const statePrices = rows.map(row => row.state_value || null);
+
+            const datasets = [{
+                label: 'Marktpreis',
+                data: marketPrices,
+                borderColor: '#ff6600',
+                backgroundColor: 'rgba(255, 102, 0, 0.1)',
+                tension: 0.3,
+                fill: true,
+                pointRadius: 6,
+                pointHoverRadius: 8,
+                borderWidth: 3
+            }];
+
+            // Staatswert-Linie hinzufügen wenn Daten vorhanden
+            const hasStateValues = statePrices.some(price => price !== null);
+            if (hasStateValues) {
+                datasets.push({
+                    label: 'Staatswert',
+                    data: statePrices,
+                    borderColor: '#00aa00',
+                    backgroundColor: 'rgba(0, 170, 0, 0.1)',
+                    tension: 0.3,
+                    fill: false,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    borderWidth: 2,
+                    borderDash: [5, 5]
+                });
+            }
 
             const configuration = {
                 type: 'line',
                 data: {
                     labels: labels,
-                    datasets: [{
-                        label: `${itemName} Preisverlauf`,
-                        data: prices,
-                        borderColor: '#ff6600',
-                        backgroundColor: 'rgba(255, 102, 0, 0.1)',
-                        tension: 0.3,
-                        fill: true,
-                        pointRadius: 6,
-                        pointHoverRadius: 8,
-                        borderWidth: 3
-                    }]
+                    datasets: datasets
                 },
                 options: {
                     responsive: true,
                     plugins: {
                         title: {
                             display: true,
-                            text: `📈 Preisverlauf: ${itemName}`,
+                            text: `📈 Preisverlauf: ${searchName}`,
                             font: { size: 16, weight: 'bold' }
                         },
                         legend: {
-                            display: false
+                            display: hasStateValues,
+                            position: 'top'
                         }
                     },
                     scales: {
@@ -403,12 +590,12 @@ async function handlePriceHistory(interaction) {
 
                 const embed = new EmbedBuilder()
                     .setColor('#ff6600')
-                    .setTitle(`📈 Preisverlauf: ${itemName}`)
+                    .setTitle(`📈 Preisverlauf: ${searchName}`)
                     .setDescription(`**${rows.length} Preiseinträge** • Diagramm zeigt die Entwicklung`)
                     .addFields(
-                        { name: '📊 Aktueller Preis', value: `${formatCurrency(prices[prices.length - 1])}`, inline: true },
-                        { name: '📈 Höchster Preis', value: `${formatCurrency(Math.max(...prices))}`, inline: true },
-                        { name: '📉 Niedrigster Preis', value: `${formatCurrency(Math.min(...prices))}`, inline: true }
+                        { name: '📊 Aktueller Marktpreis', value: `${formatCurrency(marketPrices[marketPrices.length - 1])}`, inline: true },
+                        { name: '📈 Höchster Marktpreis', value: `${formatCurrency(Math.max(...marketPrices))}`, inline: true },
+                        { name: '📉 Niedrigster Marktpreis', value: `${formatCurrency(Math.min(...marketPrices))}`, inline: true }
                     )
                     .setImage('attachment://preisverlauf.png')
                     .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
@@ -421,7 +608,7 @@ async function handlePriceHistory(interaction) {
                 // Fallback: Text-basierte Anzeige
                 const embed = new EmbedBuilder()
                     .setColor('#ff6600')
-                    .setTitle(`📈 Preisverlauf: ${itemName}`)
+                    .setTitle(`📈 Preisverlauf: ${searchName}`)
                     .setDescription('⚠️ Diagramm konnte nicht erstellt werden. Hier die letzten 10 Einträge:')
                     .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                     .setTimestamp();
@@ -431,7 +618,11 @@ async function handlePriceHistory(interaction) {
                 lastEntries.forEach((row, index) => {
                     const date = new Date(row.date_added);
                     const timestamp = Math.floor(date.getTime() / 1000);
-                    priceHistory += `**${formatCurrency(row.price)}** • <t:${timestamp}:R>\n`;
+                    priceHistory += `**${formatCurrency(row.price)}**`;
+                    if (row.state_value) {
+                        priceHistory += ` (🏛️ ${formatCurrency(row.state_value)})`;
+                    }
+                    priceHistory += ` • <t:${timestamp}:R>\n`;
                 });
 
                 embed.setDescription(`⚠️ Diagramm konnte nicht erstellt werden.\n\n**Letzte ${lastEntries.length} Einträge:**\n${priceHistory}`);
