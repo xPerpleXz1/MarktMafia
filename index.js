@@ -1,389 +1,4 @@
-// Hilfsfunktionen
-function hasTrustedDealerRole(member) {
-    return member.roles.cache.some(role => role.name === TRUSTED_DEALER_ROLE);
-}
-
-// Create Offer Handler
-async function handleCreateOffer(interaction) {
-    const member = interaction.member;
-    
-    if (!hasTrustedDealerRole(member)) {
-        return interaction.reply({
-            content: '❌ Du benötigst die Rolle `TrustedDealer` um Angebote zu erstellen!',
-            ephemeral: true
-        });
-    }
-
-    const itemName = interaction.options.getString('gegenstand').trim();
-    const quantity = interaction.options.getInteger('menge');
-    const pricePerUnit = interaction.options.getNumber('preis-pro-stueck');
-    const totalPrice = quantity * pricePerUnit;
-
-    await interaction.deferReply();
-
-    // Prüfe ob Artikel in Datenbank existiert
-    db.get(
-        'SELECT * FROM current_prices WHERE display_name = ? OR item_name = ?',
-        [itemName, itemName.toLowerCase()],
-        async (err, item) => {
-            if (err) {
-                console.error(err);
-                return interaction.followUp('Fehler beim Prüfen des Artikels!');
-            }
-
-            if (!item) {
-                return interaction.followUp(`❌ Artikel "${itemName}" nicht in der Datenbank gefunden! Füge ihn erst mit \`/preis-hinzufugen\` hinzu.`);
-            }
-
-            // Angebot in Datenbank speichern
-            const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 Tage
-            
-            db.run(
-                `INSERT INTO trade_offers (guild_id, channel_id, seller_id, seller_name, item_name, display_name, quantity, price_per_unit, total_price, expires_at) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [interaction.guildId, interaction.channelId, interaction.user.id, interaction.user.displayName, 
-                 item.item_name, item.display_name, quantity, pricePerUnit, totalPrice, expiresAt.toISOString()],
-                async function(err) {
-                    if (err) {
-                        console.error(err);
-                        return interaction.followUp('Fehler beim Erstellen des Angebots!');
-                    }
-
-                    const offerId = this.lastID;
-                    
-                    // Schönes Angebot-Embed erstellen
-                    const embed = new EmbedBuilder()
-                        .setColor('#ff6600')
-                        .setTitle('🛍️ Neues Handelsangebot')
-                        .setThumbnail(item.image_url || null)
-                        .addFields(
-                            { name: '📦 Artikel', value: `**${item.display_name}**`, inline: true },
-                            { name: '📊 Menge', value: `**${quantity} Stück**`, inline: true },
-                            { name: '💰 Preis pro Stück', value: `**${formatCurrency(pricePerUnit)}**`, inline: true },
-                            { name: '💵 Gesamtpreis', value: `**${formatCurrency(totalPrice)}**`, inline: true },
-                            { name: '🏛️ Staatswert', value: item.state_value ? `${formatCurrency(item.state_value)}` : '*Nicht verfügbar*', inline: true },
-                            { name: '👤 Verkäufer', value: `${interaction.user}`, inline: true },
-                            { name: '⏰ Gültig bis', value: `<t:${Math.floor(expiresAt.getTime() / 1000)}:f>`, inline: false }
-                        )
-                        .setFooter({ text: `Angebot ID: ${offerId} • Reagiere mit ${OFFER_EMOJI} um zu handeln!` })
-                        .setTimestamp();
-
-                    // Gewinn-Info hinzufügen wenn Staatswert vorhanden
-                    if (item.state_value) {
-                        const profit = pricePerUnit - item.state_value;
-                        const profitPercent = ((profit / item.state_value) * 100).toFixed(1);
-                        const profitEmoji = profit > 0 ? '📈' : profit < 0 ? '📉' : '➡️';
-                        
-                        embed.addFields({
-                            name: `${profitEmoji} Gewinn/Verlust vs Staat`,
-                            value: `${formatCurrency(profit)} pro Stück (${profitPercent}%)`,
-                            inline: false
-                        });
-                    }
-
-                    const message = await interaction.followUp({ embeds: [embed] });
-                    
-                    // Emoji für Handel hinzufügen
-                    await message.react(OFFER_EMOJI);
-                    
-                    // Message ID in Datenbank speichern
-                    db.run('UPDATE trade_offers SET message_id = ? WHERE id = ?', [message.id, offerId]);
-                }
-            );
-        }
-    );
-}
-
-// Handle Trade Reaction
-async function handleTradeReaction(reaction, user) {
-    if (reaction.emoji.name !== OFFER_EMOJI) return;
-
-    const message = reaction.message;
-    
-    // Prüfe ob es ein Handelsangebot ist
-    db.get(
-        'SELECT * FROM trade_offers WHERE message_id = ? AND status = "active"',
-        [message.id],
-        async (err, offer) => {
-            if (err || !offer) return;
-
-            // Verkäufer kann nicht auf eigenes Angebot reagieren
-            if (user.id === offer.seller_id) {
-                await reaction.users.remove(user.id);
-                return;
-            }
-
-            const guild = client.guilds.cache.get(offer.guild_id);
-            if (!guild) return;
-
-            const buyer = await guild.members.fetch(user.id);
-            const seller = await guild.members.fetch(offer.seller_id);
-
-            // Prüfe ob Buyer die TrustedDealer Rolle hat
-            if (!hasTrustedDealerRole(buyer)) {
-                await reaction.users.remove(user.id);
-                const dmEmbed = new EmbedBuilder()
-                    .setColor('#ff0000')
-                    .setTitle('❌ Berechtigung fehlt')
-                    .setDescription('Du benötigst die Rolle `TrustedDealer` um zu handeln!')
-                    .setTimestamp();
-                
-                try {
-                    await user.send({ embeds: [dmEmbed] });
-                } catch (error) {
-                    console.log('Konnte DM nicht senden');
-                }
-                return;
-            }
-
-            // Prüfe ob bereits ein Handelschat für dieses Angebot existiert
-            db.get(
-                'SELECT * FROM active_trades WHERE offer_id = ? AND buyer_id = ?',
-                [offer.id, user.id],
-                async (err, existingTrade) => {
-                    if (existingTrade) {
-                        await reaction.users.remove(user.id);
-                        return;
-                    }
-
-                    // Erstelle privaten Handelschat
-                    try {
-                        const tradeChannel = await guild.channels.create({
-                            name: `handel-${offer.display_name.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${Date.now()}`,
-                            type: ChannelType.GuildText,
-                            permissionOverwrites: [
-                                {
-                                    id: guild.roles.everyone,
-                                    deny: [PermissionFlagsBits.ViewChannel]
-                                },
-                                {
-                                    id: seller.id,
-                                    allow: [
-                                        PermissionFlagsBits.ViewChannel,
-                                        PermissionFlagsBits.SendMessages,
-                                        PermissionFlagsBits.AddReactions
-                                    ]
-                                },
-                                {
-                                    id: buyer.id,
-                                    allow: [
-                                        PermissionFlagsBits.ViewChannel,
-                                        PermissionFlagsBits.SendMessages,
-                                        PermissionFlagsBits.AddReactions
-                                    ]
-                                }
-                            ]
-                        });
-
-                        // Handelschat in Datenbank speichern
-                        db.run(
-                            'INSERT INTO active_trades (offer_id, trade_channel_id, seller_id, buyer_id) VALUES (?, ?, ?, ?)',
-                            [offer.id, tradeChannel.id, offer.seller_id, user.id]
-                        );
-
-                        // Willkommensnachricht im Handelschat
-                        const tradeEmbed = new EmbedBuilder()
-                            .setColor('#00ff00')
-                            .setTitle('🤝 Handelschat eröffnet')
-                            .setDescription('**Hier könnt ihr euren Handel abwickeln!**')
-                            .addFields(
-                                { name: '📦 Artikel', value: offer.display_name, inline: true },
-                                { name: '📊 Menge', value: `${offer.quantity} Stück`, inline: true },
-                                { name: '💰 Gesamtpreis', value: formatCurrency(offer.total_price), inline: true },
-                                { name: '👤 Verkäufer', value: `<@${offer.seller_id}>`, inline: true },
-                                { name: '🛒 Käufer', value: `<@${user.id}>`, inline: true },
-                                { name: '📋 Nächste Schritte', value: '1. Besprecht die Details\n2. Beide reagieren mit ✅ wenn Handel abgeschlossen\n3. Beide reagieren mit ❌ um Chat zu schließen', inline: false }
-                            )
-                            .setFooter({ text: 'Beide Parteien müssen mit ❌ reagieren um den Chat zu schließen' })
-                            .setTimestamp();
-
-                        const tradeMessage = await tradeChannel.send({ 
-                            content: `${seller} ${buyer}`, 
-                            embeds: [tradeEmbed] 
-                        });
-
-                        await tradeMessage.react(CONFIRM_EMOJI);
-                        await tradeMessage.react(CLOSE_EMOJI);
-
-                    } catch (error) {
-                        console.error('Fehler beim Erstellen des Handelschats:', error);
-                    }
-                }
-            );
-        }
-    );
-}
-
-// Handle Channel Close
-async function handleChannelClose(reaction, user) {
-    if (reaction.emoji.name !== CLOSE_EMOJI && reaction.emoji.name !== CONFIRM_EMOJI) return;
-
-    const channel = reaction.message.channel;
-    
-    // Prüfe ob es ein aktiver Handelschat ist
-    db.get(
-        'SELECT * FROM active_trades WHERE trade_channel_id = ?',
-        [channel.id],
-        async (err, trade) => {
-            if (err || !trade) return;
-
-            // Nur Seller oder Buyer können reagieren
-            if (user.id !== trade.seller_id && user.id !== trade.buyer_id) {
-                await reaction.users.remove(user.id);
-                return;
-            }
-
-            if (reaction.emoji.name === CONFIRM_EMOJI) {
-                // Bestätigung für abgeschlossenen Handel
-                if (user.id === trade.seller_id) {
-                    db.run('UPDATE active_trades SET seller_confirmed = 1 WHERE id = ?', [trade.id]);
-                } else {
-                    db.run('UPDATE active_trades SET buyer_confirmed = 1 WHERE id = ?', [trade.id]);
-                }
-
-                // Prüfe ob beide bestätigt haben
-                db.get('SELECT * FROM active_trades WHERE id = ?', [trade.id], async (err, updatedTrade) => {
-                    if (updatedTrade && updatedTrade.seller_confirmed && updatedTrade.buyer_confirmed) {
-                        const successEmbed = new EmbedBuilder()
-                            .setColor('#00ff00')
-                            .setTitle('✅ Handel erfolgreich abgeschlossen!')
-                            .setDescription('Beide Parteien haben den Handel bestätigt.')
-                            .addFields({ name: 'Status', value: '**Handel abgeschlossen** - Channel wird in 30 Sekunden gelöscht' })
-                            .setTimestamp();
-
-                        await channel.send({ embeds: [successEmbed] });
-
-                        // Angebot als verkauft markieren
-                        db.run('UPDATE trade_offers SET status = "sold" WHERE id = ?', [trade.offer_id]);
-
-                        // Channel nach 30 Sekunden löschen
-                        setTimeout(async () => {
-                            try {
-                                await channel.delete();
-                                db.run('DELETE FROM active_trades WHERE id = ?', [trade.id]);
-                            } catch (error) {
-                                console.error('Fehler beim Löschen des Channels:', error);
-                            }
-                        }, 30000);
-                    }
-                });
-
-            } else if (reaction.emoji.name === CLOSE_EMOJI) {
-                // Channel schließen
-                const reactions = reaction.message.reactions.cache.get(CLOSE_EMOJI);
-                const users = await reactions.users.fetch();
-                
-                const sellerReacted = users.has(trade.seller_id);
-                const buyerReacted = users.has(trade.buyer_id);
-
-                if (sellerReacted && buyerReacted) {
-                    const closeEmbed = new EmbedBuilder()
-                        .setColor('#ff9900')
-                        .setTitle('🔒 Handelschat wird geschlossen')
-                        .setDescription('Beide Parteien haben das Schließen bestätigt.')
-                        .addFields({ name: 'Status', value: '**Chat wird in 10 Sekunden gelöscht**' })
-                        .setTimestamp();
-
-                    await channel.send({ embeds: [closeEmbed] });
-
-                    setTimeout(async () => {
-                        try {
-                            await channel.delete();
-                            db.run('DELETE FROM active_trades WHERE id = ?', [trade.id]);
-                        } catch (error) {
-                            console.error('Fehler beim Löschen des Channels:', error);
-                        }
-                    }, 10000);
-                }
-            }
-        }
-    );
-}
-
-// My Offers Handler
-async function handleMyOffers(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    db.all(
-        'SELECT * FROM trade_offers WHERE seller_id = ? AND status = "active" ORDER BY created_at DESC',
-        [interaction.user.id],
-        (err, offers) => {
-            if (err) {
-                console.error(err);
-                return interaction.followUp('Fehler beim Laden deiner Angebote!');
-            }
-
-            if (offers.length === 0) {
-                return interaction.followUp('Du hast keine aktiven Angebote.');
-            }
-
-            const embed = new EmbedBuilder()
-                .setColor('#0099ff')
-                .setTitle('📋 Deine aktiven Angebote')
-                .setDescription(`Du hast **${offers.length}** aktive Angebote`)
-                .setTimestamp();
-
-            offers.forEach((offer, index) => {
-                const createdAt = Math.floor(new Date(offer.created_at).getTime() / 1000);
-                const expiresAt = Math.floor(new Date(offer.expires_at).getTime() / 1000);
-                
-                embed.addFields({
-                    name: `${index + 1}. ${offer.display_name}`,
-                    value: `💰 ${formatCurrency(offer.price_per_unit)} × ${offer.quantity} = **${formatCurrency(offer.total_price)}**\n📅 <t:${createdAt}:R> | ⏰ <t:${expiresAt}:R>`,
-                    inline: false
-                });
-            });
-
-            interaction.followUp({ embeds: [embed] });
-        }
-    );
-}
-
-// All Offers Handler  
-async function handleAllOffers(interaction) {
-    await interaction.deferReply();
-
-    db.all(
-        'SELECT * FROM trade_offers WHERE status = "active" AND expires_at > datetime("now") ORDER BY created_at DESC LIMIT 20',
-        (err, offers) => {
-            if (err) {
-                console.error(err);
-                return interaction.followUp('Fehler beim Laden der Angebote!');
-            }
-
-            if (offers.length === 0) {
-                return interaction.followUp('Keine aktiven Angebote verfügbar.');
-            }
-
-            const embed = new EmbedBuilder()
-                .setColor('#ff6600')
-                .setTitle('🛍️ Alle aktiven Handelsangebote')
-                .setDescription(`**${offers.length}** aktive Angebote verfügbar`)
-                .setFooter({ text: `Reagiere mit ${OFFER_EMOJI} auf ein Angebot um zu handeln!` })
-                .setTimestamp();
-
-            offers.slice(0, 10).forEach((offer, index) => {
-                const createdAt = Math.floor(new Date(offer.created_at).getTime() / 1000);
-                
-                embed.addFields({
-                    name: `${index + 1}. ${offer.display_name} (${offer.quantity}×)`,
-                    value: `💰 ${formatCurrency(offer.price_per_unit)} pro Stück = **${formatCurrency(offer.total_price)}**\n👤 ${offer.seller_name} • <t:${createdAt}:R>`,
-                    inline: true
-                });
-            });
-
-            if (offers.length > 10) {
-                embed.addFields({
-                    name: 'ℹ️ Hinweis',
-                    value: `Nur die ersten 10 Angebote werden angezeigt. Insgesamt ${offers.length} verfügbar.`,
-                    inline: false
-                });
-            }
-
-            interaction.followUp({ embeds: [embed] });
-        }
-    );
-}// Average Price Handler
+// Average Price Handler
 async function handleAveragePrice(interaction) {
     const searchName = interaction.options.getString('gegenstand').trim();
 
@@ -447,28 +62,19 @@ async function handleAveragePrice(interaction) {
             interaction.followUp({ embeds: [embed] });
         }
     );
-}const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, AttachmentBuilder, PermissionFlagsBits, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+}const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-const fs = require('fs');
-const cron = require('node-cron');
 
 // Bot Setup
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMessageReactions
+        GatewayIntentBits.MessageContent
     ]
 });
-
-// Konfiguration
-const TRUSTED_DEALER_ROLE = 'TrustedDealer';
-const OFFER_EMOJI = '💰';
-const CLOSE_EMOJI = '❌';
-const CONFIRM_EMOJI = '✅';
 
 // Database Setup
 const db = new sqlite3.Database('./strandmarkt.db');
@@ -497,37 +103,6 @@ db.serialize(() => {
         image_url TEXT,
         date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
         added_by TEXT NOT NULL
-    )`);
-
-    // Tabelle für Handelsangebote
-    db.run(`CREATE TABLE IF NOT EXISTS trade_offers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        message_id TEXT UNIQUE NOT NULL,
-        guild_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
-        seller_id TEXT NOT NULL,
-        seller_name TEXT NOT NULL,
-        item_name TEXT NOT NULL,
-        display_name TEXT NOT NULL,
-        quantity INTEGER NOT NULL,
-        price_per_unit REAL NOT NULL,
-        total_price REAL NOT NULL,
-        status TEXT DEFAULT 'active',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        expires_at DATETIME
-    )`);
-
-    // Tabelle für aktive Handelschats
-    db.run(`CREATE TABLE IF NOT EXISTS active_trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        offer_id INTEGER NOT NULL,
-        trade_channel_id TEXT NOT NULL,
-        seller_id TEXT NOT NULL,
-        buyer_id TEXT NOT NULL,
-        seller_confirmed INTEGER DEFAULT 0,
-        buyer_confirmed INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (offer_id) REFERENCES trade_offers (id)
     )`);
 
     // Migration für bestehende Datenbanken (falls jemand von alter Version kommt)
@@ -603,76 +178,7 @@ function formatCurrency(amount) {
 client.once('ready', () => {
     console.log(`Bot ist online als ${client.user.tag}!`);
     registerCommands();
-    setupBackupSchedule();
 });
-
-// Automatisches Backup um 4 Uhr nachts
-function setupBackupSchedule() {
-    // Jeden Tag um 4:00 Uhr
-    cron.schedule('0 4 * * *', () => {
-        createBackup();
-    }, {
-        scheduled: true,
-        timezone: "Europe/Berlin"
-    });
-    
-    console.log('📅 Backup-Schedule aktiviert: Täglich um 4:00 Uhr');
-}
-
-// Backup-Funktion
-async function createBackup() {
-    try {
-        const timestamp = new Date().toISOString().split('T')[0];
-        const backupPath = `./backup_${timestamp}.db`;
-        const oldBackupPath = `./backup_${getPreviousDay()}.db`;
-        
-        // Aktuelles Backup erstellen
-        await new Promise((resolve, reject) => {
-            const source = fs.createReadStream('./strandmarkt.db');
-            const dest = fs.createWriteStream(backupPath);
-            
-            source.pipe(dest);
-            source.on('end', resolve);
-            source.on('error', reject);
-        });
-        
-        // Altes Backup löschen (falls vorhanden)
-        if (fs.existsSync(oldBackupPath)) {
-            fs.unlinkSync(oldBackupPath);
-            console.log(`🗑️ Altes Backup gelöscht: ${oldBackupPath}`);
-        }
-        
-        console.log(`✅ Backup erstellt: ${backupPath}`);
-        
-        // Optional: Backup-Info in einen Log-Channel senden
-        const guilds = client.guilds.cache;
-        guilds.forEach(guild => {
-            const logChannel = guild.channels.cache.find(ch => ch.name === 'bot-logs');
-            if (logChannel) {
-                const embed = new EmbedBuilder()
-                    .setColor('#00ff00')
-                    .setTitle('📊 Automatisches Backup erstellt')
-                    .setDescription(`Datenbank-Backup wurde erfolgreich erstellt`)
-                    .addFields(
-                        { name: '📅 Datum', value: timestamp, inline: true },
-                        { name: '📁 Datei', value: `backup_${timestamp}.db`, inline: true }
-                    )
-                    .setTimestamp();
-                
-                logChannel.send({ embeds: [embed] });
-            }
-        });
-        
-    } catch (error) {
-        console.error('❌ Backup-Fehler:', error);
-    }
-}
-
-function getPreviousDay() {
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    return yesterday.toISOString().split('T')[0];
-}
 
 // Register Slash Commands
 async function registerCommands() {
@@ -727,36 +233,7 @@ async function registerCommands() {
                 option.setName('gegenstand')
                     .setDescription('Name des Gegenstands')
                     .setRequired(true)
-                    .setAutocomplete(true)),
-
-        new SlashCommandBuilder()
-            .setName('angebot-erstellen')
-            .setDescription('Erstelle ein Handelsangebot (nur für TrustedDealer)')
-            .addStringOption(option =>
-                option.setName('gegenstand')
-                    .setDescription('Artikel aus der Datenbank')
-                    .setRequired(true)
                     .setAutocomplete(true))
-            .addIntegerOption(option =>
-                option.setName('menge')
-                    .setDescription('Anzahl der Artikel')
-                    .setRequired(true)
-                    .setMinValue(1))
-            .addNumberOption(option =>
-                option.setName('preis-pro-stueck')
-                    .setDescription('Preis pro Stück')
-                    .setRequired(true)
-                    .setMinValue(1)),
-
-        new SlashCommandBuilder()
-            .setName('meine-angebote')
-            .setDescription('Zeige deine aktiven Angebote')
-            .setDefaultMemberPermissions(PermissionFlagsBits.SendMessages),
-
-        new SlashCommandBuilder()
-            .setName('alle-angebote')
-            .setDescription('Zeige alle aktiven Handelsangebote')
-            .setDefaultMemberPermissions(PermissionFlagsBits.SendMessages)
     ];
 
     try {
@@ -790,49 +267,16 @@ client.on('interactionCreate', async interaction => {
                 case 'durchschnittspreis':
                     await handleAveragePrice(interaction);
                     break;
-                case 'angebot-erstellen':
-                    await handleCreateOffer(interaction);
-                    break;
-                case 'meine-angebote':
-                    await handleMyOffers(interaction);
-                    break;
-                case 'alle-angebote':
-                    await handleAllOffers(interaction);
-                    break;
             }
         } catch (error) {
             console.error('Command Error:', error);
-            const errorMessage = { content: 'Es ist ein Fehler aufgetreten!', ephemeral: true };
-            if (interaction.replied || interaction.deferred) {
-                await interaction.followUp(errorMessage);
-            } else {
-                await interaction.reply(errorMessage);
-            }
+            await interaction.reply({
+                content: 'Es ist ein Fehler aufgetreten!',
+                ephemeral: true
+            });
         }
     } else if (interaction.isAutocomplete()) {
         await handleAutocomplete(interaction);
-    }
-});
-
-// Reaction Handler für Handelsangebote
-client.on('messageReactionAdd', async (reaction, user) => {
-    if (user.bot) return;
-    
-    try {
-        await handleTradeReaction(reaction, user, 'add');
-    } catch (error) {
-        console.error('Reaction Error:', error);
-    }
-});
-
-// Channel-Close Handler
-client.on('messageReactionAdd', async (reaction, user) => {
-    if (user.bot) return;
-    
-    try {
-        await handleChannelClose(reaction, user);
-    } catch (error) {
-        console.error('Channel Close Error:', error);
     }
 });
 
