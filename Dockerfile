@@ -1,7 +1,10 @@
-# Node.js Base Image
+# Node.js Base Image - Use LTS Alpine for smaller size
 FROM node:18-alpine
 
-# System dependencies für SQLite und Charts
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies for image processing and PostgreSQL
 RUN apk add --no-cache \
     python3 \
     make \
@@ -10,31 +13,35 @@ RUN apk add --no-cache \
     jpeg-dev \
     pango-dev \
     giflib-dev \
-    pixman-dev
+    pixman-dev \
+    postgresql-client \
+    curl
 
-# Arbeitsverzeichnis erstellen
-WORKDIR /app
-
-# Package files kopieren
+# Copy package files first for better caching
 COPY package*.json ./
 
-# Dependencies installieren
-RUN npm install --only=production
+# Install production dependencies only
+RUN npm ci --only=production && npm cache clean --force
 
-# App Code kopieren
+# Copy application code
 COPY . .
 
-# Port exposieren (optional für Health Checks)
-EXPOSE 3000
+# Create non-root user for security
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S discordbot -u 1001 -G nodejs
 
-# Datenbank Ordner erstellen
-RUN mkdir -p /app/data
-
-# User für Sicherheit
-RUN addgroup -g 1001 -S nodejs
-RUN adduser -S discordbot -u 1001
+# Set ownership of app directory
 RUN chown -R discordbot:nodejs /app
+
+# Switch to non-root user
 USER discordbot
 
-# Bot starten
+# Expose port for health checks
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Start the bot
 CMD ["npm", "start"]
