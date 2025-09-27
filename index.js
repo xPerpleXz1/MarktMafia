@@ -1,4 +1,15 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, AttachmentBuilder } = require('discord.js');
+const { 
+    Client, 
+    GatewayIntentBits, 
+    SlashCommandBuilder, 
+    EmbedBuilder, 
+    AttachmentBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    ChannelType,
+    PermissionFlagsBits
+} = require('discord.js');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 const { Pool } = require('pg');
 const sharp = require('sharp');
@@ -19,18 +30,30 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.MessageReactions
     ]
 });
+
+// Configuration
+const config = {
+    tradingRoles: process.env.TRADING_ROLES ? process.env.TRADING_ROLES.split(',') : [
+        'Trader', 'Verified Trader', 'Trusted Trader', 'Dealer', 'Händler'
+    ],
+    tradingCategoryId: process.env.TRADING_CATEGORY_ID || null,
+    maxTradeChannels: parseInt(process.env.MAX_TRADE_CHANNELS) || 20,
+    tradeChannelTimeout: parseInt(process.env.TRADE_CHANNEL_TIMEOUT) || 3600000, // 1 hour
+    maxFileSize: (process.env.MAX_FILE_SIZE || 10) * 1024 * 1024,
+    allowedFormats: (process.env.ALLOWED_FORMATS || 'jpg,jpeg,png,gif,webp').split(',')
+};
 
 // Chart Configuration
 const width = 800;
 const height = 400;
 const chartJSNodeCanvas = new ChartJSNodeCanvas({ width, height });
 
-// Image Processing Configuration
-const MAX_FILE_SIZE = (process.env.MAX_FILE_SIZE || 10) * 1024 * 1024; // MB to Bytes
-const ALLOWED_FORMATS = (process.env.ALLOWED_FORMATS || 'jpg,jpeg,png,gif,webp').split(',');
+// Active Trade Channels Storage
+const activeTradeChannels = new Map();
 
 // Database Helper Functions
 const db = {
@@ -86,6 +109,7 @@ async function initializeDatabase() {
     try {
         console.log('🔄 Initialisiere PostgreSQL Datenbank...');
 
+        // Current prices table
         await db.query(`
             CREATE TABLE IF NOT EXISTS current_prices (
                 id SERIAL PRIMARY KEY,
@@ -102,6 +126,7 @@ async function initializeDatabase() {
             )
         `);
 
+        // Price history table
         await db.query(`
             CREATE TABLE IF NOT EXISTS price_history (
                 id SERIAL PRIMARY KEY,
@@ -117,11 +142,58 @@ async function initializeDatabase() {
             )
         `);
 
+        // Trade offers table
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS trade_offers (
+                offer_id SERIAL PRIMARY KEY,
+                creator_id VARCHAR(255) NOT NULL,
+                creator_name VARCHAR(255) NOT NULL,
+                guild_id VARCHAR(255) NOT NULL,
+                channel_id VARCHAR(255),
+                message_id VARCHAR(255),
+                item_name VARCHAR(255) NOT NULL,
+                item_description TEXT,
+                quantity INTEGER DEFAULT 1,
+                price_amount DECIMAL(12,2) NOT NULL,
+                price_currency VARCHAR(10) DEFAULT 'EUR',
+                offer_type VARCHAR(10) CHECK (offer_type IN ('buy', 'sell')) NOT NULL,
+                status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cancelled', 'expired')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                interested_users JSONB DEFAULT '[]'::jsonb
+            )
+        `);
+
+        // Trade sessions table
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS trade_sessions (
+                session_id SERIAL PRIMARY KEY,
+                offer_id INTEGER REFERENCES trade_offers(offer_id),
+                buyer_id VARCHAR(255) NOT NULL,
+                seller_id VARCHAR(255) NOT NULL,
+                buyer_name VARCHAR(255) NOT NULL,
+                seller_name VARCHAR(255) NOT NULL,
+                guild_id VARCHAR(255) NOT NULL,
+                channel_id VARCHAR(255),
+                status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'completed', 'cancelled')),
+                agreed_price DECIMAL(12,2) NOT NULL,
+                agreed_currency VARCHAR(10) DEFAULT 'EUR',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                accepted_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                trade_data JSONB DEFAULT '{}'::jsonb
+            )
+        `);
+
         // Create indexes for better performance
         await db.query(`CREATE INDEX IF NOT EXISTS idx_current_prices_item_name ON current_prices(item_name)`);
         await db.query(`CREATE INDEX IF NOT EXISTS idx_current_prices_display_name ON current_prices(display_name)`);
         await db.query(`CREATE INDEX IF NOT EXISTS idx_price_history_item_name ON price_history(item_name)`);
         await db.query(`CREATE INDEX IF NOT EXISTS idx_price_history_date ON price_history(date_added)`);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_trade_offers_status ON trade_offers(status)`);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_trade_offers_creator ON trade_offers(creator_id)`);
+        await db.query(`CREATE INDEX IF NOT EXISTS idx_trade_sessions_status ON trade_sessions(status)`);
 
         console.log('✅ PostgreSQL Datenbank erfolgreich initialisiert!');
     } catch (error) {
@@ -140,6 +212,17 @@ function formatCurrency(amount) {
     }).format(amount);
 }
 
+function generateTradeId() {
+    return Math.random().toString(36).substr(2, 9).toUpperCase();
+}
+
+function hasTradePermissions(member) {
+    if (!member || !member.roles) return false;
+    return config.tradingRoles.some(roleName => 
+        member.roles.cache.some(role => role.name === roleName)
+    );
+}
+
 async function processImage(attachment) {
     try {
         if (!attachment.contentType || !attachment.contentType.startsWith('image/')) {
@@ -147,12 +230,12 @@ async function processImage(attachment) {
         }
 
         const format = attachment.contentType.split('/')[1];
-        if (!ALLOWED_FORMATS.includes(format)) {
-            throw new Error(`Format nicht erlaubt! Erlaubt: ${ALLOWED_FORMATS.join(', ')}`);
+        if (!config.allowedFormats.includes(format)) {
+            throw new Error(`Format nicht erlaubt! Erlaubt: ${config.allowedFormats.join(', ')}`);
         }
 
-        if (attachment.size > MAX_FILE_SIZE) {
-            throw new Error(`Datei zu groß! Maximum: ${MAX_FILE_SIZE / 1024 / 1024}MB`);
+        if (attachment.size > config.maxFileSize) {
+            throw new Error(`Datei zu groß! Maximum: ${config.maxFileSize / 1024 / 1024}MB`);
         }
 
         const response = await fetch(attachment.url);
@@ -182,6 +265,76 @@ async function processImage(attachment) {
     }
 }
 
+async function createTradeChannel(guild, offer, interestedUser) {
+    try {
+        const channelName = `handel-${offer.item_name.replace(/\s+/g, '-').toLowerCase()}-${generateTradeId()}`;
+        
+        const channel = await guild.channels.create({
+            name: channelName,
+            type: ChannelType.GuildText,
+            parent: config.tradingCategoryId,
+            permissionOverwrites: [
+                {
+                    id: guild.roles.everyone,
+                    deny: [PermissionFlagsBits.ViewChannel],
+                },
+                {
+                    id: offer.creator_id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ],
+                },
+                {
+                    id: interestedUser.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ],
+                },
+                {
+                    id: client.user.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ManageChannels,
+                        PermissionFlagsBits.EmbedLinks
+                    ],
+                },
+            ],
+        });
+
+        // Store active channel info
+        activeTradeChannels.set(channel.id, {
+            offerId: offer.offer_id,
+            creatorId: offer.creator_id,
+            interestedUserId: interestedUser.id,
+            createdAt: Date.now()
+        });
+
+        // Auto-delete after timeout
+        setTimeout(async () => {
+            try {
+                if (activeTradeChannels.has(channel.id)) {
+                    await channel.delete('Automatische Löschung nach Timeout');
+                    activeTradeChannels.delete(channel.id);
+                }
+            } catch (error) {
+                console.error('Fehler beim Löschen des Trade-Channels:', error);
+            }
+        }, config.tradeChannelTimeout);
+
+        return channel;
+    } catch (error) {
+        console.error('Fehler beim Erstellen des Trade-Channels:', error);
+        throw error;
+    }
+}
+
 // Bot Events
 client.once('ready', async () => {
     console.log(`🤖 Bot ist online als ${client.user.tag}!`);
@@ -200,6 +353,7 @@ client.once('ready', async () => {
 // Register Slash Commands
 async function registerCommands() {
     const commands = [
+        // Existing commands
         new SlashCommandBuilder()
             .setName('preis-hinzufugen')
             .setDescription('Füge einen neuen Strandmarktpreis hinzu')
@@ -259,7 +413,56 @@ async function registerCommands() {
                 option.setName('gegenstand')
                     .setDescription('Name des Gegenstands')
                     .setRequired(true)
-                    .setAutocomplete(true))
+                    .setAutocomplete(true)),
+
+        // New commands
+        new SlashCommandBuilder()
+            .setName('help')
+            .setDescription('Zeige alle verfügbaren Commands und Informationen'),
+
+        new SlashCommandBuilder()
+            .setName('angebot-erstellen')
+            .setDescription('Erstelle ein Handelsangebot (nur für Trader)')
+            .addStringOption(option =>
+                option.setName('typ')
+                    .setDescription('Art des Angebots')
+                    .setRequired(true)
+                    .addChoices(
+                        { name: '💰 Verkaufen', value: 'sell' },
+                        { name: '🛒 Kaufen', value: 'buy' }
+                    ))
+            .addStringOption(option =>
+                option.setName('gegenstand')
+                    .setDescription('Was möchtest du handeln?')
+                    .setRequired(true))
+            .addNumberOption(option =>
+                option.setName('preis')
+                    .setDescription('Dein Preis in EUR')
+                    .setRequired(true))
+            .addIntegerOption(option =>
+                option.setName('anzahl')
+                    .setDescription('Anzahl der Items (Standard: 1)')
+                    .setRequired(false))
+            .addStringOption(option =>
+                option.setName('beschreibung')
+                    .setDescription('Zusätzliche Informationen zum Angebot')
+                    .setRequired(false)),
+
+        new SlashCommandBuilder()
+            .setName('meine-angebote')
+            .setDescription('Zeige deine aktiven Handelsangebote'),
+
+        new SlashCommandBuilder()
+            .setName('angebote-anzeigen')
+            .setDescription('Zeige alle aktiven Handelsangebote')
+            .addStringOption(option =>
+                option.setName('typ')
+                    .setDescription('Filter nach Angebotstyp')
+                    .setRequired(false)
+                    .addChoices(
+                        { name: '💰 Verkaufsangebote', value: 'sell' },
+                        { name: '🛒 Kaufgesuche', value: 'buy' }
+                    ))
     ];
 
     try {
@@ -296,6 +499,18 @@ client.on('interactionCreate', async interaction => {
                 case 'bild-anzeigen':
                     await handleShowImage(interaction);
                     break;
+                case 'help':
+                    await handleHelp(interaction);
+                    break;
+                case 'angebot-erstellen':
+                    await handleCreateOffer(interaction);
+                    break;
+                case 'meine-angebote':
+                    await handleMyOffers(interaction);
+                    break;
+                case 'angebote-anzeigen':
+                    await handleShowOffers(interaction);
+                    break;
             }
         } catch (error) {
             console.error('Command Error:', error);
@@ -307,6 +522,8 @@ client.on('interactionCreate', async interaction => {
                 await interaction.reply({ content: errorMessage, ephemeral: true });
             }
         }
+    } else if (interaction.isButton()) {
+        await handleButtonInteraction(interaction);
     } else if (interaction.isAutocomplete()) {
         await handleAutocomplete(interaction);
     }
@@ -337,7 +554,89 @@ async function handleAutocomplete(interaction) {
     }
 }
 
-// Add Price Handler
+// Button Interaction Handler
+async function handleButtonInteraction(interaction) {
+    const [action, offerId, userId] = interaction.customId.split('_');
+    
+    try {
+        switch (action) {
+            case 'interest':
+                await handleInterestButton(interaction, parseInt(offerId));
+                break;
+            case 'complete':
+                await handleCompleteButton(interaction, parseInt(offerId));
+                break;
+            case 'cancel':
+                await handleCancelButton(interaction, parseInt(offerId));
+                break;
+        }
+    } catch (error) {
+        console.error('Button Interaction Error:', error);
+        await interaction.reply({ 
+            content: `❌ Fehler bei der Aktion: ${error.message}`, 
+            ephemeral: true 
+        });
+    }
+}
+
+// Help Command Handler
+async function handleHelp(interaction) {
+    const embed = new EmbedBuilder()
+        .setColor('#0099ff')
+        .setTitle('🤖 GTA V Grand RP Strandmarkt Bot - Hilfe')
+        .setDescription('**Alle verfügbaren Commands und Features**')
+        .setThumbnail(client.user.displayAvatarURL())
+        .addFields(
+            {
+                name: '💰 **Preis-Commands**',
+                value: `\`/preis-hinzufugen\` - Neuen Preis hinzufügen/aktualisieren
+                \`/preis-anzeigen\` - Aktuellen Preis anzeigen
+                \`/alle-preise\` - Alle Preise auflisten
+                \`/preis-verlauf\` - Preisentwicklung mit Diagramm
+                \`/durchschnittspreis\` - Statistiken berechnen
+                \`/bild-anzeigen\` - Gespeichertes Bild anzeigen`,
+                inline: false
+            },
+            {
+                name: '🔄 **Handels-Commands** (nur für Trader)',
+                value: `\`/angebot-erstellen\` - Neues Handelsangebot erstellen
+                \`/meine-angebote\` - Deine aktiven Angebote anzeigen
+                \`/angebote-anzeigen\` - Alle verfügbaren Angebote`,
+                inline: false
+            },
+            {
+                name: '🎯 **Features**',
+                value: `📸 **Bildupload:** Bilder werden automatisch als Thumbnails angezeigt
+                🔍 **Auto-Complete:** Intelligente Vorschläge bei der Eingabe
+                📊 **Diagramme:** Interaktive Preisverlaufs-Charts
+                🏛️ **Staatswerte:** Vergleich mit NPC-Preisen
+                💬 **Private Handel:** Automatische Trade-Channels
+                🔒 **Rollenberechtigung:** Nur Trader können handeln`,
+                inline: false
+            },
+            {
+                name: '⚙️ **Trader-Rollen**',
+                value: config.tradingRoles.map(role => `• ${role}`).join('\n') || 'Keine Rollen konfiguriert',
+                inline: true
+            },
+            {
+                name: '📋 **Bildupload**',
+                value: `**Erlaubte Formate:** ${config.allowedFormats.join(', ').toUpperCase()}
+                **Max. Größe:** ${config.maxFileSize / 1024 / 1024}MB
+                **Automatische Optimierung:** Ja`,
+                inline: true
+            }
+        )
+        .setFooter({ 
+            text: 'GTA V Grand RP • Strandmarkt Bot • /help für diese Hilfe',
+            iconURL: interaction.guild?.iconURL() 
+        })
+        .setTimestamp();
+
+    await interaction.reply({ embeds: [embed], ephemeral: true });
+}
+
+// Add Price Handler (FIXED: Images now show as thumbnails)
 async function handleAddPrice(interaction) {
     const displayName = interaction.options.getString('gegenstand').trim();
     const itemName = displayName.toLowerCase();
@@ -428,34 +727,51 @@ async function handleAddPrice(interaction) {
                 .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
                 .setTimestamp();
 
-            // Add status info
-            let statusInfo = '🆕 Neuer Eintrag erstellt';
-            if (existing) {
-                statusInfo = '🔄 Bestehender Eintrag aktualisiert';
-                if (finalStateValue !== stateValue && stateValue === null) {
-                    statusInfo += ' (Staatswert beibehalten)';
-                }
-                if (finalImageData !== imageData && !imageData && existing.image_data) {
-                    statusInfo += ' (Bild beibehalten)';
-                }
+            // FIXED: Add image as thumbnail if available
+            if (finalImageData) {
+                const attachment = new AttachmentBuilder(finalImageData, { 
+                    name: finalImageFilename || 'item.jpg' 
+                });
+                embed.setThumbnail(`attachment://${finalImageFilename || 'item.jpg'}`);
+                
+                // Send with image attachment
+                await interaction.followUp({ 
+                    embeds: [embed.addFields({ 
+                        name: 'ℹ️ Status', 
+                        value: (existing ? '🔄 Bestehender Eintrag aktualisiert' : '🆕 Neuer Eintrag erstellt') + processingInfo, 
+                        inline: false 
+                    })], 
+                    files: [attachment] 
+                });
+            } else {
+                // Send without image
+                embed.addFields({ 
+                    name: 'ℹ️ Status', 
+                    value: (existing ? '🔄 Bestehender Eintrag aktualisiert' : '🆕 Neuer Eintrag erstellt'), 
+                    inline: false 
+                });
+                
+                await interaction.followUp({ embeds: [embed] });
             }
 
-            embed.addFields({ name: 'ℹ️ Status', value: statusInfo + processingInfo, inline: false });
-
-            // Profit calculation if both prices available
+            // Add profit calculation if both prices available
             if (finalStateValue && finalStateValue > 0) {
                 const profit = marketPrice - finalStateValue;
                 const profitPercent = ((profit / finalStateValue) * 100).toFixed(1);
                 const profitColor = profit > 0 ? '📈' : '📉';
                 
-                embed.addFields({
-                    name: `${profitColor} Gewinn/Verlust`,
-                    value: `**${formatCurrency(profit)}** (${profitPercent}%)`,
-                    inline: false
-                });
+                const profitEmbed = new EmbedBuilder()
+                    .setColor(profit > 0 ? '#00ff00' : '#ff0000')
+                    .addFields({
+                        name: `${profitColor} Gewinn/Verlust`,
+                        value: `**${formatCurrency(profit)}** (${profitPercent}%)`,
+                        inline: false
+                    });
+                
+                if (finalImageData) {
+                    await interaction.followUp({ embeds: [profitEmbed] });
+                }
             }
-
-            await interaction.followUp({ embeds: [embed] });
         });
 
     } catch (error) {
@@ -464,7 +780,7 @@ async function handleAddPrice(interaction) {
     }
 }
 
-// Show Price Handler
+// Show Price Handler (FIXED: Images now always show as thumbnails)
 async function handleShowPrice(interaction) {
     const searchName = interaction.options.getString('gegenstand').trim();
     await interaction.deferReply();
@@ -507,7 +823,7 @@ async function handleShowPrice(interaction) {
             });
         }
 
-        // Show image as thumbnail if available
+        // FIXED: Always show image as thumbnail if available
         if (row.image_data) {
             const attachment = new AttachmentBuilder(row.image_data, { name: row.image_filename || 'item.jpg' });
             embed.setThumbnail(`attachment://${row.image_filename || 'item.jpg'}`);
@@ -824,6 +1140,402 @@ async function handleShowImage(interaction) {
     }
 }
 
+// NEW: Create Trade Offer Handler
+async function handleCreateOffer(interaction) {
+    // Check if user has trading permissions
+    if (!hasTradePermissions(interaction.member)) {
+        await interaction.reply({
+            content: `🚫 **Keine Berechtigung!**\n\nDu benötigst eine der folgenden Rollen zum Handeln:\n${config.tradingRoles.map(role => `• ${role}`).join('\n')}`,
+            ephemeral: true
+        });
+        return;
+    }
+
+    const offerType = interaction.options.getString('typ');
+    const itemName = interaction.options.getString('gegenstand').trim();
+    const price = interaction.options.getNumber('preis');
+    const quantity = interaction.options.getInteger('anzahl') || 1;
+    const description = interaction.options.getString('beschreibung') || '';
+
+    await interaction.deferReply();
+
+    try {
+        // Create offer in database
+        const result = await db.query(`
+            INSERT INTO trade_offers (creator_id, creator_name, guild_id, item_name, item_description, quantity, price_amount, offer_type)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING offer_id
+        `, [
+            interaction.user.id,
+            interaction.user.displayName,
+            interaction.guild.id,
+            itemName,
+            description,
+            quantity,
+            price,
+            offerType
+        ]);
+
+        const offerId = result.rows[0].offer_id;
+
+        // Create offer embed
+        const embed = new EmbedBuilder()
+            .setColor(offerType === 'sell' ? '#00ff00' : '#ff6b35')
+            .setTitle(`${offerType === 'sell' ? '💰 Verkaufsangebot' : '🛒 Kaufgesuch'}`)
+            .setDescription(`**${itemName}**`)
+            .addFields(
+                { name: '💵 Preis', value: `${formatCurrency(price)}`, inline: true },
+                { name: '📦 Anzahl', value: quantity.toString(), inline: true },
+                { name: '👤 Anbieter', value: `<@${interaction.user.id}>`, inline: true }
+            )
+            .setFooter({ 
+                text: `Angebot ID: ${offerId} • Reagiere mit Interesse!`,
+                iconURL: interaction.user.displayAvatarURL() 
+            })
+            .setTimestamp();
+
+        if (description) {
+            embed.addFields({ name: '📝 Beschreibung', value: description, inline: false });
+        }
+
+        // Create interest button
+        const button = new ButtonBuilder()
+            .setCustomId(`interest_${offerId}_${interaction.user.id}`)
+            .setLabel('Interesse anmelden')
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji('🤝');
+
+        const row = new ActionRowBuilder().addComponents(button);
+
+        const message = await interaction.followUp({ 
+            embeds: [embed], 
+            components: [row] 
+        });
+
+        // Update offer with message ID
+        await db.query(`
+            UPDATE trade_offers 
+            SET channel_id = $1, message_id = $2 
+            WHERE offer_id = $3
+        `, [interaction.channel.id, message.id, offerId]);
+
+    } catch (error) {
+        console.error('Create Offer Error:', error);
+        await interaction.followUp(`❌ **Fehler beim Erstellen des Angebots:** ${error.message}`);
+    }
+}
+
+// NEW: Handle Interest Button
+async function handleInterestButton(interaction, offerId) {
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+        // Get offer details
+        const offer = await db.queryRow(`
+            SELECT * FROM trade_offers 
+            WHERE offer_id = $1 AND status = 'active'
+        `, [offerId]);
+
+        if (!offer) {
+            await interaction.followUp({ 
+                content: '❌ Dieses Angebot ist nicht mehr verfügbar!', 
+                ephemeral: true 
+            });
+            return;
+        }
+
+        // Check if user is trying to respond to their own offer
+        if (offer.creator_id === interaction.user.id) {
+            await interaction.followUp({ 
+                content: '❌ Du kannst nicht auf dein eigenes Angebot reagieren!', 
+                ephemeral: true 
+            });
+            return;
+        }
+
+        // Check if user has trading permissions
+        if (!hasTradePermissions(interaction.member)) {
+            await interaction.followUp({
+                content: `🚫 **Keine Berechtigung!**\n\nDu benötigst eine der folgenden Rollen zum Handeln:\n${config.tradingRoles.map(role => `• ${role}`).join('\n')}`,
+                ephemeral: true
+            });
+            return;
+        }
+
+        // Create private trading channel
+        const tradeChannel = await createTradeChannel(interaction.guild, offer, interaction.user);
+
+        // Create trade session in database
+        const sessionResult = await db.query(`
+            INSERT INTO trade_sessions (offer_id, buyer_id, seller_id, buyer_name, seller_name, guild_id, channel_id, agreed_price)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING session_id
+        `, [
+            offerId,
+            offer.offer_type === 'sell' ? interaction.user.id : offer.creator_id,
+            offer.offer_type === 'sell' ? offer.creator_id : interaction.user.id,
+            offer.offer_type === 'sell' ? interaction.user.displayName : offer.creator_name,
+            offer.offer_type === 'sell' ? offer.creator_name : interaction.user.displayName,
+            interaction.guild.id,
+            tradeChannel.id,
+            offer.price_amount
+        ]);
+
+        const sessionId = sessionResult.rows[0].session_id;
+
+        // Send welcome message in trade channel
+        const welcomeEmbed = new EmbedBuilder()
+            .setColor('#0099ff')
+            .setTitle('🤝 Neuer Handel gestartet!')
+            .setDescription(`**${offer.item_name}**`)
+            .addFields(
+                { name: '💰 Verkäufer', value: `<@${offer.offer_type === 'sell' ? offer.creator_id : interaction.user.id}>`, inline: true },
+                { name: '🛒 Käufer', value: `<@${offer.offer_type === 'sell' ? interaction.user.id : offer.creator_id}>`, inline: true },
+                { name: '💵 Preis', value: formatCurrency(offer.price_amount), inline: true },
+                { name: '📦 Anzahl', value: offer.quantity.toString(), inline: true }
+            )
+            .setFooter({ text: `Session ID: ${sessionId} • Kanal wird automatisch nach 1h gelöscht` })
+            .setTimestamp();
+
+        if (offer.item_description) {
+            welcomeEmbed.addFields({ name: '📝 Beschreibung', value: offer.item_description, inline: false });
+        }
+
+        const completeButton = new ButtonBuilder()
+            .setCustomId(`complete_${sessionId}_${interaction.user.id}`)
+            .setLabel('Handel abschließen')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('✅');
+
+        const cancelButton = new ButtonBuilder()
+            .setCustomId(`cancel_${sessionId}_${interaction.user.id}`)
+            .setLabel('Handel abbrechen')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('❌');
+
+        const actionRow = new ActionRowBuilder().addComponents(completeButton, cancelButton);
+
+        await tradeChannel.send({ 
+            content: `<@${offer.creator_id}> <@${interaction.user.id}>`,
+            embeds: [welcomeEmbed], 
+            components: [actionRow] 
+        });
+
+        await interaction.followUp({ 
+            content: `✅ **Handel gestartet!**\n\nEin privater Handels-Channel wurde erstellt: ${tradeChannel}\n\nDort könnt ihr die Details besprechen und den Handel abschließen.`, 
+            ephemeral: true 
+        });
+
+    } catch (error) {
+        console.error('Interest Button Error:', error);
+        await interaction.followUp({ 
+            content: `❌ Fehler beim Starten des Handels: ${error.message}`, 
+            ephemeral: true 
+        });
+    }
+}
+
+// NEW: Handle Complete Button
+async function handleCompleteButton(interaction, sessionId) {
+    await interaction.deferReply();
+
+    try {
+        // Update trade session as completed
+        await db.query(`
+            UPDATE trade_sessions 
+            SET status = 'completed', completed_at = CURRENT_TIMESTAMP 
+            WHERE session_id = $1
+        `, [sessionId]);
+
+        // Update offer status
+        const session = await db.queryRow(`
+            SELECT offer_id FROM trade_sessions WHERE session_id = $1
+        `, [sessionId]);
+
+        if (session) {
+            await db.query(`
+                UPDATE trade_offers 
+                SET status = 'completed', updated_at = CURRENT_TIMESTAMP 
+                WHERE offer_id = $1
+            `, [session.offer_id]);
+        }
+
+        const successEmbed = new EmbedBuilder()
+            .setColor('#00ff00')
+            .setTitle('✅ Handel erfolgreich abgeschlossen!')
+            .setDescription('Vielen Dank für euren fairen Handel!')
+            .addFields(
+                { name: '📋 Session ID', value: sessionId.toString(), inline: true },
+                { name: '🕐 Abgeschlossen', value: `<t:${Math.floor(Date.now() / 1000)}:f>`, inline: true }
+            )
+            .setFooter({ text: 'Dieser Channel wird in 5 Minuten automatisch gelöscht' })
+            .setTimestamp();
+
+        await interaction.followUp({ embeds: [successEmbed] });
+
+        // Delete channel after 5 minutes
+        setTimeout(async () => {
+            try {
+                await interaction.channel.delete('Handel abgeschlossen');
+                activeTradeChannels.delete(interaction.channel.id);
+            } catch (error) {
+                console.error('Fehler beim Löschen des Trade-Channels:', error);
+            }
+        }, 300000); // 5 minutes
+
+    } catch (error) {
+        console.error('Complete Button Error:', error);
+        await interaction.followUp(`❌ Fehler beim Abschließen: ${error.message}`);
+    }
+}
+
+// NEW: Handle Cancel Button
+async function handleCancelButton(interaction, sessionId) {
+    await interaction.deferReply();
+
+    try {
+        // Update trade session as cancelled
+        await db.query(`
+            UPDATE trade_sessions 
+            SET status = 'cancelled' 
+            WHERE session_id = $1
+        `, [sessionId]);
+
+        const cancelEmbed = new EmbedBuilder()
+            .setColor('#ff0000')
+            .setTitle('❌ Handel abgebrochen')
+            .setDescription('Der Handel wurde abgebrochen.')
+            .addFields(
+                { name: '📋 Session ID', value: sessionId.toString(), inline: true },
+                { name: '🕐 Abgebrochen', value: `<t:${Math.floor(Date.now() / 1000)}:f>`, inline: true }
+            )
+            .setFooter({ text: 'Dieser Channel wird in 30 Sekunden gelöscht' })
+            .setTimestamp();
+
+        await interaction.followUp({ embeds: [cancelEmbed] });
+
+        // Delete channel after 30 seconds
+        setTimeout(async () => {
+            try {
+                await interaction.channel.delete('Handel abgebrochen');
+                activeTradeChannels.delete(interaction.channel.id);
+            } catch (error) {
+                console.error('Fehler beim Löschen des Trade-Channels:', error);
+            }
+        }, 30000); // 30 seconds
+
+    } catch (error) {
+        console.error('Cancel Button Error:', error);
+        await interaction.followUp(`❌ Fehler beim Abbrechen: ${error.message}`);
+    }
+}
+
+// NEW: My Offers Handler
+async function handleMyOffers(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+        const offers = await db.queryRows(`
+            SELECT * FROM trade_offers 
+            WHERE creator_id = $1 AND status = 'active' 
+            ORDER BY created_at DESC
+        `, [interaction.user.id]);
+
+        if (offers.length === 0) {
+            await interaction.followUp({ 
+                content: '📭 **Keine aktiven Angebote**\n\nDu hast derzeit keine aktiven Handelsangebote.\nErstelle ein neues mit `/angebot-erstellen`!', 
+                ephemeral: true 
+            });
+            return;
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor('#9900ff')
+            .setTitle(`📋 Deine aktiven Angebote (${offers.length})`)
+            .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
+            .setTimestamp();
+
+        let offersList = '';
+        offers.forEach((offer, index) => {
+            const emoji = offer.offer_type === 'sell' ? '💰' : '🛒';
+            const typeText = offer.offer_type === 'sell' ? 'Verkauf' : 'Kaufgesuch';
+            
+            offersList += `${emoji} **${offer.item_name}** (${typeText})\n`;
+            offersList += `💵 ${formatCurrency(offer.price_amount)} • 📦 ${offer.quantity}x\n`;
+            offersList += `🆔 ${offer.offer_id} • <t:${Math.floor(new Date(offer.created_at).getTime() / 1000)}:R>\n\n`;
+        });
+
+        embed.setDescription(offersList);
+
+        await interaction.followUp({ embeds: [embed], ephemeral: true });
+
+    } catch (error) {
+        console.error('My Offers Error:', error);
+        await interaction.followUp({ 
+            content: `❌ Fehler beim Abrufen deiner Angebote: ${error.message}`, 
+            ephemeral: true 
+        });
+    }
+}
+
+// NEW: Show Offers Handler
+async function handleShowOffers(interaction) {
+    const filterType = interaction.options.getString('typ');
+    await interaction.deferReply();
+
+    try {
+        let query = `
+            SELECT * FROM trade_offers 
+            WHERE status = 'active' AND guild_id = $1
+        `;
+        let params = [interaction.guild.id];
+
+        if (filterType) {
+            query += ` AND offer_type = $2`;
+            params.push(filterType);
+        }
+
+        query += ` ORDER BY created_at DESC LIMIT 10`;
+
+        const offers = await db.queryRows(query, params);
+
+        if (offers.length === 0) {
+            const typeText = filterType === 'sell' ? 'Verkaufsangebote' : filterType === 'buy' ? 'Kaufgesuche' : 'Angebote';
+            await interaction.followUp(`📭 **Keine aktiven ${typeText}**\n\nDerzeit sind keine ${typeText.toLowerCase()} verfügbar.`);
+            return;
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor('#00aaff')
+            .setTitle(`🏪 Aktive Angebote ${filterType ? (filterType === 'sell' ? '(Verkauf)' : '(Kaufgesuche)') : ''}`)
+            .setDescription(`**${offers.length} Angebote verfügbar** • Reagiere mit 🤝 um Interesse zu zeigen`)
+            .setFooter({ text: 'GTA V Grand RP • Strandmarkt Bot' })
+            .setTimestamp();
+
+        let offersList = '';
+        offers.forEach((offer, index) => {
+            const emoji = offer.offer_type === 'sell' ? '💰' : '🛒';
+            const typeText = offer.offer_type === 'sell' ? 'Verkauf' : 'Kaufgesuch';
+            
+            offersList += `${emoji} **${offer.item_name}** (${typeText})\n`;
+            offersList += `💵 ${formatCurrency(offer.price_amount)} • 📦 ${offer.quantity}x • 👤 <@${offer.creator_id}>\n`;
+            offersList += `🆔 ${offer.offer_id} • <t:${Math.floor(new Date(offer.created_at).getTime() / 1000)}:R>\n\n`;
+        });
+
+        if (offersList.length > 4000) {
+            offersList = offersList.substring(0, 4000) + '...\n\n*Zu viele Angebote - zeige nur die ersten*';
+        }
+
+        embed.setDescription(`**${offers.length} Angebote verfügbar** • Reagiere mit 🤝 um Interesse zu zeigen\n\n${offersList}`);
+
+        await interaction.followUp({ embeds: [embed] });
+
+    } catch (error) {
+        console.error('Show Offers Error:', error);
+        await interaction.followUp(`❌ Fehler beim Abrufen der Angebote: ${error.message}`);
+    }
+}
+
 // Error Handling
 process.on('unhandledRejection', error => {
     console.error('Unhandled promise rejection:', error);
@@ -857,7 +1569,8 @@ const server = http.createServer((req, res) => {
             status: 'healthy', 
             bot: client.isReady() ? 'online' : 'offline',
             uptime: process.uptime(),
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            activeTradeChannels: activeTradeChannels.size
         }));
     } else {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
